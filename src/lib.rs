@@ -11,3 +11,5 @@ pub mod panel;
 pub mod esdhc;
 pub mod snapshot;
 pub mod fast;
+pub mod gui;
+pub mod ekfs;

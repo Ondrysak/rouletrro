@@ -11,6 +11,9 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
 lz4_flex = "0.11"
 serde-big-array = "0.5"
+minifb = { version = "0.27", default-features = false, features = ["x11"] }
+cpal = "0.15"
+png = "0.17"
 
 [profile.release]
 debug = 1

@@ -32,6 +32,12 @@ fn main() {
     let mut counts: Vec<u32> = Vec::new();
     let mut profile_after: Option<u64> = None;
     let mut save: Option<String> = None;
+    let mut wav: Option<String> = None;
+    let mut card: Option<String> = None;
+    let mut pcm: Vec<i32> = Vec::new();
+    let mut presses: Vec<(u8, u64, u64)> = Vec::new();
+    let mut step_no = 0;
+    let mut turns: Vec<(u64, u8, i8)> = Vec::new();
     let mut load: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -43,6 +49,26 @@ fn main() {
             "--break" => {
                 let a = u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap();
                 breaks.push(a);
+            }
+            "--press" => {
+                // --press CODE@CLOCK[:HOLD]  e.g. 6@4100M:50M
+                let v = it.next().unwrap();
+                let (code, rest) = v.split_once('@').unwrap();
+                let (at, hold) = rest.split_once(':').unwrap_or((rest, "30M"));
+                presses.push((code.parse::<u8>().unwrap(), num(at), num(hold)));
+            }
+            "--wav" => wav = it.next().cloned(),
+            "--card" => card = it.next().cloned(),
+            "--turn" => {
+                // --turn ENC:DELTA@CLOCKxCOUNT[/SPACING], one turn every SPACING (4M)
+                let v = it.next().unwrap();
+                let (ed, rest) = v.split_once('@').unwrap();
+                let (e, d) = ed.split_once(':').unwrap();
+                let (rest, spacing) = rest.split_once('/').map(|(a, b)| (a, num(b))).unwrap_or((rest, 4_000_000));
+                let (at, count) = rest.split_once('x').unwrap_or((rest, "1"));
+                for k in 0..count.parse::<u64>().unwrap() {
+                    turns.push((num(at) + k * spacing, e.parse().unwrap(), d.parse().unwrap()));
+                }
             }
             "--save" => save = it.next().cloned(),
             "--load" => load = it.next().cloned(),
@@ -83,6 +109,10 @@ fn main() {
         let o = a & 0x07FF_FFFF;
         m.cpu.bus.watch = Some((o, o + 4));
     }
+    if let Some(p) = &card {
+        m.attach_card(std::path::Path::new(p)).unwrap();
+        println!("card {p}: {} sectors in use", m.cpu.bus.io.esdhc.card.sectors.len());
+    }
     if let Some(p) = &load {
         dtemu::snapshot::load(&mut m, std::path::Path::new(p)).unwrap();
         println!("restored {p} at clock {}", m.now());
@@ -98,7 +128,50 @@ fn main() {
                 m.cpu.profile = Some(Default::default());
             }
         }
+        // Key presses and encoder turns scheduled inside this chunk, in time order.
+        // kind: 0 = key down, 1 = key up, 2 = turn
+        let mut events: Vec<(u64, u8, u8, i8)> = Vec::new();
+        for &(code, at, hold) in &presses {
+            events.push((at, 0, code, 0));
+            events.push((at + hold, 1, code, 0));
+        }
+        for &(at, e, d) in &turns {
+            events.push((at, 2, e, d));
+        }
+        events.sort();
+        for (at, kind, code, d) in events {
+            if at < m.now() || at >= target {
+                continue;
+            }
+            m.run_until(at);
+            if kind == 2 {
+                m.turn(code, d);
+                if let Some(dir) = std::env::var_os("DTBOOT_TURN_PNG") {
+                    let settle = m.now() + std::env::var("DTBOOT_TURN_SETTLE").ok().and_then(|v| v.parse().ok()).unwrap_or(3_000_000);
+                    m.run_until(settle);
+                    step_no += 1;
+                    oled_png(&m, &std::path::Path::new(&dir).join(format!("turn{step_no:02}.png")));
+                }
+                continue;
+            }
+            let down = kind == 0;
+            m.key(code, down);
+            println!("[{:>12}] key {} {}", m.now(), dtemu::panel::key_name(code).unwrap_or("?"), if down { "down" } else { "up" });
+            if !down && std::env::var_os("DTBOOT_STEPS").is_some() {
+                let settle = m.now() + 40_000_000;
+                m.run_until(settle);
+                if let Some(dir) = std::env::var_os("DTBOOT_PNG_DIR") {
+                    step_no += 1;
+                    oled_png(&m, &std::path::Path::new(&dir).join(format!("step{step_no:02}_{}.png", dtemu::panel::key_name(code).unwrap_or("K"))));
+                } else {
+                    print!("{}", Machine::frame_ascii(&m.cpu.bus.io.panel.oled));
+                }
+            }
+        }
         let stop = m.run_until(target);
+        if wav.is_some() {
+            pcm.extend(m.cpu.bus.io.ssi.out.drain(..));
+        }
         for l in &m.log[logged..] {
             println!("{l}");
         }
@@ -146,6 +219,12 @@ fn main() {
             println!("STOPPED with nothing to wake it at pc=0x{:08x}", m.cpu.pc);
             break;
         }
+    }
+    if let Some(p) = &wav {
+        write_wav(p, &pcm);
+        let peak = pcm.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0);
+        let nz = pcm.iter().filter(|&&x| x != 0).count();
+        println!("wrote {p}: {} frames, peak {peak} (of 8388607), {nz} nonzero samples", pcm.len() / 2);
     }
     if let Some(p) = &save {
         dtemu::snapshot::save(&m, std::path::Path::new(p)).unwrap();
@@ -198,6 +277,7 @@ fn main() {
             println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total as f64);
         }
     }
+    println!("+Drive mounted: {}", m.drive_mounted());
     println!("icache: {} decodes, {} invalidating stores", m.cpu.bus.icache_decodes, m.cpu.bus.icache_invalidations);
     let c = &m.cpu;
     for (pc, a, n, v) in c.bus.watch_log.iter().take(40) {
@@ -226,7 +306,42 @@ fn main() {
     let peak = ssi.out.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0);
     println!("ssi: frames={} buffered={} nonzero={} peak={} tx_pending={}", ssi.frames, ssi.out.len(), nz, peak, ssi.tx_pending);
     println!("edma: erq={:016x} int={:016x} majors[34]={} [35]={} [59]={}", c.bus.io.edma.erq, c.bus.io.edma.int, c.bus.io.edma.majors[34], c.bus.io.edma.majors[35], c.bus.io.edma.majors[59]);
-    if let Some(f) = &m.frame {
+    if std::env::var_os("DTBOOT_OLED").is_some() {
+        println!("panel MCU OLED ({} frames):", m.cpu.bus.io.panel.oled_frames);
+        print!("{}", Machine::frame_ascii(&m.cpu.bus.io.panel.oled));
+    } else if let Some(f) = &m.frame {
         print!("{}", Machine::frame_ascii(f));
     }
+}
+
+/// 16-bit stereo WAV at 48 kHz from 24-bit samples.
+fn write_wav(path: &str, pcm: &[i32]) {
+    let data: Vec<u8> = pcm.iter().flat_map(|&s| ((s >> 8) as i16).to_le_bytes()).collect();
+    let mut f = Vec::new();
+    f.extend_from_slice(b"RIFF");
+    f.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    f.extend_from_slice(b"WAVEfmt ");
+    f.extend_from_slice(&16u32.to_le_bytes());
+    f.extend_from_slice(&1u16.to_le_bytes());
+    f.extend_from_slice(&2u16.to_le_bytes());
+    f.extend_from_slice(&48_000u32.to_le_bytes());
+    f.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+    f.extend_from_slice(&4u16.to_le_bytes());
+    f.extend_from_slice(&16u16.to_le_bytes());
+    f.extend_from_slice(b"data");
+    f.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    f.extend_from_slice(&data);
+    std::fs::write(path, f).unwrap();
+}
+
+fn oled_png(m: &Machine, path: &std::path::Path) {
+    let mut cv = dtemu::gui::Canvas::new(128 * 3, 64 * 3);
+    let oled = &m.cpu.bus.io.panel.oled;
+    for y in 0..64usize {
+        for x in 0..128usize {
+            let on = (oled[(7 - y / 8) + 8 * x] >> (y % 8)) & 1 != 0;
+            cv.fill(x as i32 * 3, y as i32 * 3, 3, 3, if on { 0xFFFFFF } else { 0 });
+        }
+    }
+    dtemu::gui::save_png(&cv, path).unwrap();
 }

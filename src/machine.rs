@@ -269,6 +269,47 @@ impl Machine {
         out
     }
 
+    /// Attach a +Drive card image (read now; `flush_card` writes it back).
+    pub fn attach_card(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        self.cpu.bus.io.esdhc.card = crate::esdhc::Card::open(path)?;
+        Ok(())
+    }
+
+    pub fn flush_card(&mut self) -> std::io::Result<()> {
+        self.cpu.bus.io.esdhc.card.flush()
+    }
+
+    /// The firmware's own "+Drive mounted" flag.
+    pub fn drive_mounted(&self) -> bool {
+        self.cpu.bus.peek32(self.prof.mounted) == 1
+    }
+
+    /// Press or release a key by control code (see `panel::key_name`).
+    pub fn key(&mut self, code: u8, down: bool) {
+        if let Some(msg) = self.cpu.bus.io.panel.key(code, down) {
+            self.panel_send(&msg);
+        }
+    }
+
+    /// Turn an encoder (0..8: A..H, then LEVEL/DATA) by `delta` counts.
+    pub fn turn(&mut self, enc: u8, delta: i8) {
+        let msg = crate::panel::PanelMcu::encoder(enc, delta);
+        self.panel_send(&msg);
+    }
+
+    pub fn release_all_keys(&mut self) {
+        let msg = self.cpu.bus.io.panel.release_all();
+        if !msg.is_empty() {
+            self.panel_send(&msg);
+        }
+    }
+
+    /// Bytes from the panel MCU to the ColdFire, on UART8.
+    pub fn panel_send(&mut self, bytes: &[u8]) {
+        self.cpu.bus.io.uart_receive(8, bytes);
+        self.cpu.bus.run_dma();
+    }
+
     /// Panel frame as rows of pixels (true = lit), y = 0 at the top.
     pub fn frame_pixels(buf: &[u8]) -> Vec<Vec<bool>> {
         // SSD1306-style pages, page 0 at the bottom (a remapped COM scan):
