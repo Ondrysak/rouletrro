@@ -65,6 +65,8 @@ pub(crate) enum Loc {
     I(u32),
 }
 
+/// `repr(C)` keeps `a` straight after `d`, so `reg` can index Rn as 0-15.
+#[repr(C)]
 pub struct Cpu {
     pub d: [u32; 8],
     pub a: [u32; 8],
@@ -220,6 +222,14 @@ impl Cpu {
     #[inline(always)]
     pub(crate) fn flag(&self, f: u16) -> bool {
         self.sr & f != 0
+    }
+
+    /// Rn as 0-15: D0-D7 then A0-A7.
+    #[inline(always)]
+    pub(crate) fn reg(&self, n: usize) -> u32 {
+        // SAFETY: `repr(C)` puts `d` at offset 0 and `a` directly after it,
+        // so the first 16 words of the struct are D0-D7, A0-A7.
+        unsafe { *(self as *const Cpu as *const u32).add(n & 15) }
     }
 
     #[inline(always)]

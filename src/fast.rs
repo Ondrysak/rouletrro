@@ -148,8 +148,19 @@ fn h_addx<const SUB: bool>(c: &mut Cpu, o: &Op) {
 /// MOVE.L ACCy,Rx / MOVCLR.L: `r` = Rx as 0-15, `x` = y | clear << 8.
 fn h_movacc(c: &mut Cpu, o: &Op) {
     use crate::cpu::MACSR_PAV0;
+    use crate::cpu::{MACSR_FI, MACSR_OMC, MACSR_RT, MACSR_SU};
     let i = (o.x & 3) as usize;
-    let v = c.mac_read(i);
+    let v = if c.macsr & (MACSR_FI | MACSR_SU | MACSR_RT) == MACSR_FI {
+        // Fractional, no rounding: bits 39-8, saturated under OMC.
+        let q = c.accv[i] >> 8;
+        if c.macsr & MACSR_OMC != 0 && q != q as i32 as i64 {
+            if q < 0 { i32::MIN as u32 } else { i32::MAX as u32 }
+        } else {
+            q as u32
+        }
+    } else {
+        c.mac_read(i)
+    };
     let r = o.r as usize;
     if r >= 8 {
         c.a[r - 8] = v;
@@ -389,6 +400,91 @@ fn h_movem(c: &mut Cpu, o: &Op) {
             }
         }
         a = a.wrapping_add(4);
+    }
+}
+
+/// MAC/MSAC in signed fractional mode without rounding -- the audio
+/// engine's resampler and mixer. LM is the load's addressing mode (0 none,
+/// 2 (An), 3 (An)+, 4 -(An), 5 (d16,An)); LONG takes 32-bit operands.
+/// Anything else at run time goes to `h_mac`.
+fn h_mac_f<const LM: u8, const LONG: bool>(c: &mut Cpu, o: &Op) {
+    use crate::cpu::{MACSR_FI, MACSR_OMC, MACSR_PAV0, MACSR_RT, MACSR_SU, MACSR_V};
+    let m = c.macsr;
+    if m & (MACSR_RT | MACSR_SU | MACSR_FI) != MACSR_FI {
+        return h_mac(c, o);
+    }
+    let ext = o.x;
+    let op = o.op;
+    let acc = ((o.x >> 24) & 3) as usize;
+    let rx = c.reg(((o.x >> 16) & 15) as usize);
+    let ry = c.reg(((o.x >> 20) & 15) as usize);
+    let mut addr = 0;
+    let mut lv = 0;
+    if LM != 0 {
+        let reg = (op & 7) as usize;
+        let base = match LM {
+            2 | 3 => c.a[reg],
+            4 => c.a[reg].wrapping_sub(4),
+            _ => c.a[reg].wrapping_add(disp_of(o)),
+        };
+        addr = if ext & 0x20 != 0 { base & c.mask } else { base };
+        lv = c.bus.read32(addr);
+    }
+    let pav = MACSR_PAV0 << acc;
+    if !(m & MACSR_OMC != 0 && m & pav != 0) {
+        let (x, y) = if LONG {
+            (rx, ry)
+        } else {
+            (
+                if ext & 0x80 != 0 { rx & 0xFFFF_0000 } else { rx << 16 },
+                if ext & 0x40 != 0 { ry & 0xFFFF_0000 } else { ry << 16 },
+            )
+        };
+        let mut flags = m & !0xF;
+        let p: i64 = if x == 0x8000_0000 && y == 0x8000_0000 {
+            1i64 << 39
+        } else {
+            (((x as i32 as i64) * (y as i32 as i64)) << 1) >> 24
+        };
+        let cur = c.accv[acc];
+        let sum = if ext & 0x100 != 0 { cur.wrapping_sub(p) } else { cur.wrapping_add(p) };
+        let mut v = sum;
+        if (sum << 16) >> 16 != sum {
+            flags |= MACSR_V | pav;
+            v = if m & MACSR_OMC != 0 {
+                if sum < 0 { 0xFFFF_FF80_0000_0000u64 as i64 } else { 0x007F_FFFF_FF00 }
+            } else {
+                (sum << 16) >> 16
+            };
+        }
+        c.accv[acc] = v;
+        if v == 0 {
+            flags |= 0x4;
+        } else if v & (1i64 << 47) != 0 {
+            flags |= 0x8;
+        }
+        if flags & pav != 0 {
+            flags |= MACSR_V;
+        }
+        let t = v >> 39;
+        if t != 0 && t != -1 {
+            flags |= 0x1;
+        }
+        c.macsr = flags;
+    }
+    if LM != 0 {
+        let rw = ((op >> 9) & 7) as usize;
+        if op & 0x40 != 0 {
+            c.a[rw] = lv;
+        } else {
+            c.d[rw] = lv;
+        }
+        let reg = (op & 7) as usize;
+        match LM {
+            3 => c.a[reg] = addr.wrapping_add(4),
+            4 => c.a[reg] = addr,
+            _ => {}
+        }
     }
 }
 
@@ -1077,7 +1173,21 @@ fn decode_inner(rd: &mut Rd, op: u16) -> Option<Op> {
                 } else {
                     (((op >> 9) & 7) | if op & 0x40 != 0 { 8 } else { 0 }, (op & 7) | if op & 8 != 0 { 8 } else { 0 })
                 };
-                let mut o = mk(h_mac);
+                let long = ext & 0x0800 != 0;
+                let lm = if load { mode as u8 } else { 0 };
+                let mut o = mk(match (lm, long) {
+                    (0, false) => h_mac_f::<0, false>,
+                    (2, false) => h_mac_f::<2, false>,
+                    (3, false) => h_mac_f::<3, false>,
+                    (4, false) => h_mac_f::<4, false>,
+                    (_, false) => h_mac_f::<5, false>,
+                    (0, true) => h_mac_f::<0, true>,
+                    (2, true) => h_mac_f::<2, true>,
+                    (3, true) => h_mac_f::<3, true>,
+                    (4, true) => h_mac_f::<4, true>,
+                    (_, true) => h_mac_f::<5, true>,
+                });
+                o.op = op;
                 o.x = ext as u32 | (rx as u32) << 16 | (ry as u32) << 20 | (acc as u32) << 24;
                 o.a = Ea::Imm(disp);
                 return Some(o);
