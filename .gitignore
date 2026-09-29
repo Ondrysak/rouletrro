@@ -1,0 +1,7 @@
+/target
+# Elektron firmware and anything derived from it is not ours to publish.
+*.syx
+/sections/
+/snapshots/
+*.snap
+*.img

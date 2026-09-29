@@ -1,0 +1,17 @@
+[package]
+name = "dtemu"
+version = "0.1.0"
+edition = "2021"
+description = "Digitakt mk1 (OS 1.53) emulator: ColdFire MCF5441x in Rust"
+license = "MIT"
+
+[dependencies]
+sha2 = "0.10"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 2
