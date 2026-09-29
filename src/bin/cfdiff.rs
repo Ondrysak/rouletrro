@@ -17,6 +17,9 @@ fn pattern(i: usize) -> u8 {
 
 fn main() {
     let mut cpu = Cpu::new(Bus::new(128));
+    if std::env::var_os("CFDIFF_NO_ICACHE").is_none() {
+        cpu.bus.icache_enable(0x10000);
+    }
     let data: Vec<u8> = (0..DATA_LEN).map(pattern).collect();
     // Every vector points at a marker so an exception is visible.
     cpu.vbr = 0x4000_0000;

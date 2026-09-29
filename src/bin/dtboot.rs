@@ -179,11 +179,26 @@ fn main() {
         }
         let mut v: Vec<_> = by_fn.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut ops: std::collections::HashMap<u16, u64> = Default::default();
+        for (pc, n) in p {
+            *ops.entry(m.cpu.bus.peek16(*pc)).or_insert(0) += n;
+        }
+        let mut ov: Vec<_> = ops.into_iter().collect();
+        ov.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut acc = 0.0;
+        println!("opcodes:");
+        for (o, n) in ov.iter().take(40) {
+            let f = *n as f64 * 100.0 / total as f64;
+            acc += f;
+            println!("  {o:04x} {f:5.2}% (cum {acc:5.1}%)");
+        }
+        println!("distinct opcodes: {}", ov.len());
         println!("guest profile ({total} samples), by 256-byte region:");
         for (a, n) in v.iter().take(25) {
             println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total as f64);
         }
     }
+    println!("icache: {} decodes, {} invalidating stores", m.cpu.bus.icache_decodes, m.cpu.bus.icache_invalidations);
     let c = &m.cpu;
     for (pc, a, n, v) in c.bus.watch_log.iter().take(40) {
         println!("watch: pc={pc:08x} [{a:08x}].{n} <- {v:08x}");

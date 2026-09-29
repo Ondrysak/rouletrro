@@ -58,7 +58,7 @@ pub enum Stop {
 }
 
 #[derive(Clone, Copy)]
-enum Loc {
+pub(crate) enum Loc {
     D(usize),
     A(usize),
     M(u32),
@@ -79,10 +79,11 @@ pub struct Cpu {
 
     pub macsr: u32,
     pub mask: u32,
-    /// ACC0-3, physical.
-    pub acc: [u32; 4],
-    /// ACCext0-3, physical: upper byte in bits 15-8, lower byte in 7-0.
-    pub accext: [u16; 4],
+    /// ACC0-3 as 48-bit values in the current MACSR mode (sign-extended,
+    /// or zero-extended in unsigned integer mode). The physical registers,
+    /// ACCn and ACCextn, are derived from these (`acc_phys`) and a mode
+    /// change reinterprets them (`set_macsr`), as on the device.
+    pub accv: [i64; 4],
 
     pub stopped: bool,
     /// Address of the instruction being executed.
@@ -98,8 +99,9 @@ pub struct Cpu {
     pub last_fault: Option<(u8, u32)>,
     /// Count of exceptions raised by vector, for diagnostics.
     pub exc_counts: [u64; 256],
-    /// Guest PC samples, one per 1024 instructions, when enabled.
+    /// Guest PC samples, at block entries about every 64 instructions.
     pub profile: Option<std::collections::HashMap<u32, u64>>,
+    next_sample: u64,
     /// A ring of the last executed PCs, when enabled (debugging).
     pub history: Option<(Vec<u32>, usize)>,
     /// The first few faults: (vector, pc, opcode, clock).
@@ -148,8 +150,7 @@ impl Cpu {
             ctl: Default::default(),
             macsr: 0,
             mask: 0xFFFF_FFFF,
-            acc: [0; 4],
-            accext: [0; 4],
+            accv: [0; 4],
             stopped: false,
             op_pc: 0,
             bus,
@@ -161,12 +162,15 @@ impl Cpu {
             fault_log: Vec::new(),
             history: None,
             profile: None,
+            next_sample: 0,
         }
     }
 
     // -- hooks ------------------------------------------------------------
 
     pub fn set_hook(&mut self, pc: u32, on: bool) {
+        // A hooked PC must start a block.
+        self.bus.icache_flush();
         let o = pc.wrapping_sub(self.hook_base);
         assert!(o < HOOK_WINDOW, "hook 0x{pc:08x} outside the hook window");
         let bit = (o >> 1) as usize;
@@ -178,7 +182,7 @@ impl Cpu {
     }
 
     #[inline(always)]
-    fn hooked(&self, pc: u32) -> bool {
+    pub(crate) fn hooked(&self, pc: u32) -> bool {
         let o = pc.wrapping_sub(self.hook_base);
         if o >= HOOK_WINDOW {
             return false;
@@ -209,17 +213,17 @@ impl Cpu {
     }
 
     #[inline(always)]
-    fn set_ccr(&mut self, v: u16) {
+    pub(crate) fn set_ccr(&mut self, v: u16) {
         self.sr = (self.sr & 0xFF00) | (v & 0x1F);
     }
 
     #[inline(always)]
-    fn flag(&self, f: u16) -> bool {
+    pub(crate) fn flag(&self, f: u16) -> bool {
         self.sr & f != 0
     }
 
     #[inline(always)]
-    fn set_nz(&mut self, v: u32, sz: u32) {
+    pub(crate) fn set_nz(&mut self, v: u32, sz: u32) {
         let m = sz_mask(sz);
         let mut c = self.sr & !(CF_N | CF_Z | CF_V | CF_C);
         if v & m == 0 {
@@ -231,7 +235,7 @@ impl Cpu {
         self.sr = c;
     }
 
-    fn cond(&self, cc: u16) -> bool {
+    pub(crate) fn cond(&self, cc: u16) -> bool {
         let c = self.flag(CF_C);
         let v = self.flag(CF_V);
         let z = self.flag(CF_Z);
@@ -277,14 +281,14 @@ impl Cpu {
     }
 
     #[inline(always)]
-    fn fetch16(&mut self) -> u16 {
+    pub(crate) fn fetch16(&mut self) -> u16 {
         let v = self.bus.read16(self.pc);
         self.pc = self.pc.wrapping_add(2);
         v
     }
 
     #[inline(always)]
-    fn fetch32(&mut self) -> u32 {
+    pub(crate) fn fetch32(&mut self) -> u32 {
         let v = self.bus.read32(self.pc);
         self.pc = self.pc.wrapping_add(4);
         v
@@ -306,7 +310,7 @@ impl Cpu {
     // -- effective addresses ---------------------------------------------
 
     /// The brief extension word format: (d8, base, Xi.size*scale).
-    fn index_ea(&mut self, base: u32) -> u32 {
+    pub(crate) fn index_ea(&mut self, base: u32) -> u32 {
         let ext = self.fetch16();
         let r = ((ext >> 12) & 7) as usize;
         let xi = if ext & 0x8000 != 0 { self.a[r] } else { self.d[r] };
@@ -318,7 +322,7 @@ impl Cpu {
 
     /// Resolve an effective address for an operand of `sz` bytes. Applies
     /// (An)+ and -(An) side effects, so call it exactly once per operand.
-    fn ea(&mut self, mode: u16, reg: u16, sz: u32) -> Loc {
+    pub(crate) fn ea(&mut self, mode: u16, reg: u16, sz: u32) -> Loc {
         let r = reg as usize;
         match mode {
             0 => Loc::D(r),
@@ -371,7 +375,7 @@ impl Cpu {
     }
 
     /// The address of a control-mode EA (LEA, PEA, JMP, JSR, MOVEM).
-    fn ea_addr(&mut self, mode: u16, reg: u16) -> Option<u32> {
+    pub(crate) fn ea_addr(&mut self, mode: u16, reg: u16) -> Option<u32> {
         match mode {
             2 | 5 | 6 => match self.ea(mode, reg, 4) {
                 Loc::M(a) => Some(a),
@@ -386,7 +390,7 @@ impl Cpu {
     }
 
     #[inline(always)]
-    fn read_loc(&mut self, l: Loc, sz: u32) -> u32 {
+    pub(crate) fn read_loc(&mut self, l: Loc, sz: u32) -> u32 {
         match l {
             Loc::D(r) => self.d[r] & sz_mask(sz),
             Loc::A(r) => self.a[r] & sz_mask(sz),
@@ -396,7 +400,7 @@ impl Cpu {
     }
 
     #[inline(always)]
-    fn write_loc(&mut self, l: Loc, sz: u32, v: u32) {
+    pub(crate) fn write_loc(&mut self, l: Loc, sz: u32, v: u32) {
         match l {
             Loc::D(r) => {
                 let m = sz_mask(sz);
@@ -433,7 +437,7 @@ impl Cpu {
         self.stopped = false;
     }
 
-    fn rte(&mut self) {
+    pub(crate) fn rte(&mut self) {
         let sp = self.a[7];
         let w0 = self.bus.read32(sp);
         let pc = self.bus.read32(sp.wrapping_add(4));
@@ -454,7 +458,7 @@ impl Cpu {
         true
     }
 
-    fn illegal(&mut self, vec: u8) {
+    pub(crate) fn illegal(&mut self, vec: u8) {
         let pc = self.op_pc;
         if self.fault_log.len() < 32 {
             let op = self.bus.peek16(pc);
@@ -501,20 +505,19 @@ impl Cpu {
                 }
                 self.skip_hook = None;
             }
-            self.op_pc = pc;
-            self.bus.pc = pc;
-            self.bus.io.now = now + 1;
-            if now & 0x3FF == 0 {
-                if let Some(p) = &mut self.profile {
-                    *p.entry(pc).or_insert(0) += 1;
+            if self.bus.in_code_window(pc) && self.history.is_none() {
+                self.run_block(pc);
+            } else {
+                self.op_pc = pc;
+                self.bus.pc = pc;
+                self.bus.io.now = now + 1;
+                if let Some((h, i)) = &mut self.history {
+                    let n = h.len();
+                    h[*i % n] = pc;
+                    *i += 1;
                 }
+                self.execute();
             }
-            if let Some((h, i)) = &mut self.history {
-                let n = h.len();
-                h[*i % n] = pc;
-                *i += 1;
-            }
-            self.execute();
             if let Some((v, p)) = self.last_fault.take() {
                 let h = self.bus.peek32(self.vbr.wrapping_add(v as u32 * 4));
                 if h == 0 || h == 0xFFFF_FFFF {
@@ -524,17 +527,58 @@ impl Cpu {
         }
     }
 
+    /// Run the predecoded block at `pc` (building it first if need be).
+    /// Stops early when control leaves the straight line: a taken branch,
+    /// an exception, STOP.
+    #[inline(always)]
+    fn run_block(&mut self, pc: u32) {
+        self.bus.icache_settle();
+        if let Some(p) = &mut self.profile {
+            if self.bus.io.now >= self.next_sample {
+                *p.entry(pc).or_insert(0) += 1;
+                self.next_sample = self.bus.io.now + 64;
+            }
+        }
+        let blk = match self.bus.block_at(pc) {
+            Some(b) => b,
+            None => crate::fast::build_block(self, pc),
+        };
+        // SAFETY: blocks are boxed and only dropped by `icache_settle`,
+        // which runs between blocks, never while one executes.
+        let ops: &[crate::fast::Op] = unsafe { &*blk };
+        let mut pc = pc;
+        for op in ops {
+            self.op_pc = pc;
+            self.bus.pc = pc;
+            self.bus.io.now += 1;
+            let next = pc.wrapping_add(op.len as u32);
+            self.pc = next;
+            (op.h)(self, op);
+            if self.pc != next || self.stopped {
+                break;
+            }
+            pc = next;
+        }
+    }
+
     /// Execute exactly one instruction.
     pub fn step(&mut self) {
         let pc = self.pc;
         self.op_pc = pc;
         self.bus.pc = pc;
         self.bus.io.now += 1;
-        self.execute();
+        let op = crate::fast::decode(self, pc);
+        self.pc = pc.wrapping_add(op.len as u32);
+        (op.h)(self, &op);
     }
 
-    fn execute(&mut self) {
+    pub(crate) fn execute(&mut self) {
         let op = self.fetch16();
+        self.dispatch(op);
+    }
+
+    /// Execute `op`, already fetched, with PC past it.
+    pub(crate) fn dispatch(&mut self, op: u16) {
         match op >> 12 {
             0x0 => self.line0(op),
             0x1 => self.op_move(op, 1),
@@ -557,7 +601,7 @@ impl Cpu {
 
     // -- arithmetic helpers -----------------------------------------------
 
-    fn add_flags(&mut self, s: u32, d: u32, sz: u32, x: bool) -> u32 {
+    pub(crate) fn add_flags(&mut self, s: u32, d: u32, sz: u32, x: bool) -> u32 {
         let m = sz_mask(sz);
         let (s, d) = (s & m, d & m);
         let wide = s as u64 + d as u64 + x as u64;
@@ -583,7 +627,7 @@ impl Cpu {
     }
 
     /// d - s - x, all condition codes including X.
-    fn sub_flags(&mut self, s: u32, d: u32, sz: u32, x: bool) -> u32 {
+    pub(crate) fn sub_flags(&mut self, s: u32, d: u32, sz: u32, x: bool) -> u32 {
         let m = sz_mask(sz);
         let (s, d) = (s & m, d & m);
         let r = d.wrapping_sub(s).wrapping_sub(x as u32) & m;
@@ -607,7 +651,7 @@ impl Cpu {
         r
     }
 
-    fn cmp_flags(&mut self, s: u32, d: u32, sz: u32) {
+    pub(crate) fn cmp_flags(&mut self, s: u32, d: u32, sz: u32) {
         let x = self.sr & CF_X;
         self.sub_flags(s, d, sz, false);
         self.sr = (self.sr & !CF_X) | x;
@@ -615,7 +659,7 @@ impl Cpu {
 
     // -- line 0: bit operations, immediates, ISA_C extras ------------------
 
-    fn line0(&mut self, op: u16) {
+    pub(crate) fn line0(&mut self, op: u16) {
         let mode = (op >> 3) & 7;
         let reg = op & 7;
         if op & 0x0100 != 0 {
@@ -689,7 +733,7 @@ impl Cpu {
         }
     }
 
-    fn bitop(&mut self, kind: u16, bit: u32, mode: u16, reg: u16) {
+    pub(crate) fn bitop(&mut self, kind: u16, bit: u32, mode: u16, reg: u16) {
         if mode == 0 {
             let r = reg as usize;
             let m = 1u32 << (bit & 31);
@@ -718,7 +762,7 @@ impl Cpu {
 
     // -- MOVE ------------------------------------------------------------
 
-    fn op_move(&mut self, op: u16, sz: u32) {
+    pub(crate) fn op_move(&mut self, op: u16, sz: u32) {
         let src = self.ea((op >> 3) & 7, op & 7, sz);
         let v = self.read_loc(src, sz);
         let dmode = (op >> 6) & 7;
@@ -735,7 +779,7 @@ impl Cpu {
 
     // -- line 4: miscellaneous --------------------------------------------
 
-    fn line4(&mut self, op: u16) {
+    pub(crate) fn line4(&mut self, op: u16) {
         let mode = (op >> 3) & 7;
         let reg = op & 7;
         let r = reg as usize;
@@ -1024,7 +1068,7 @@ impl Cpu {
         }
     }
 
-    fn movem(&mut self, mode: u16, reg: u16, to_mem: bool) {
+    pub(crate) fn movem(&mut self, mode: u16, reg: u16, to_mem: bool) {
         let mask = self.fetch16();
         let base = match mode {
             2 => self.a[reg as usize],
@@ -1054,7 +1098,7 @@ impl Cpu {
         }
     }
 
-    fn mul_l(&mut self, mode: u16, reg: u16) {
+    pub(crate) fn mul_l(&mut self, mode: u16, reg: u16) {
         let ext = self.fetch16();
         let l = self.ea(mode, reg, 4);
         let s = self.read_loc(l, 4);
@@ -1068,7 +1112,7 @@ impl Cpu {
         self.set_nz(res, 4);
     }
 
-    fn div_l(&mut self, mode: u16, reg: u16) {
+    pub(crate) fn div_l(&mut self, mode: u16, reg: u16) {
         let ext = self.fetch16();
         let l = self.ea(mode, reg, 4);
         let s = self.read_loc(l, 4);
@@ -1137,7 +1181,7 @@ impl Cpu {
 
     // -- line 5: ADDQ, SUBQ, Scc, TPF --------------------------------------
 
-    fn line5(&mut self, op: u16) {
+    pub(crate) fn line5(&mut self, op: u16) {
         let mode = (op >> 3) & 7;
         let reg = op & 7;
         if (op >> 6) & 3 == 3 {
@@ -1211,7 +1255,7 @@ impl Cpu {
 
     // -- line 7: MOVEQ, MVS, MVZ --------------------------------------------
 
-    fn line7(&mut self, op: u16) {
+    pub(crate) fn line7(&mut self, op: u16) {
         let dn = ((op >> 9) & 7) as usize;
         if op & 0x100 == 0 {
             let v = op as u8 as i8 as i32 as u32;
@@ -1230,7 +1274,7 @@ impl Cpu {
 
     // -- line 8: OR, DIVU.W, DIVS.W -----------------------------------------
 
-    fn line8(&mut self, op: u16) {
+    pub(crate) fn line8(&mut self, op: u16) {
         let dn = ((op >> 9) & 7) as usize;
         let opmode = (op >> 6) & 7;
         let mode = (op >> 3) & 7;
@@ -1258,7 +1302,7 @@ impl Cpu {
         }
     }
 
-    fn div_w(&mut self, dn: usize, s: u32, signed: bool) {
+    pub(crate) fn div_w(&mut self, dn: usize, s: u32, signed: bool) {
         let s16 = s & 0xFFFF;
         if s16 == 0 {
             let pc = self.pc;
@@ -1285,7 +1329,7 @@ impl Cpu {
 
     // -- lines 9 and D: SUB/ADD family ---------------------------------------
 
-    fn line9d(&mut self, op: u16, add: bool) {
+    pub(crate) fn line9d(&mut self, op: u16, add: bool) {
         let dn = ((op >> 9) & 7) as usize;
         let opmode = (op >> 6) & 7;
         let mode = (op >> 3) & 7;
@@ -1335,7 +1379,7 @@ impl Cpu {
 
     // -- line B: CMP, CMPA, EOR ----------------------------------------------
 
-    fn lineb(&mut self, op: u16) {
+    pub(crate) fn lineb(&mut self, op: u16) {
         let dn = ((op >> 9) & 7) as usize;
         let opmode = (op >> 6) & 7;
         let mode = (op >> 3) & 7;
@@ -1367,7 +1411,7 @@ impl Cpu {
 
     // -- line C: AND, MULU.W, MULS.W -----------------------------------------
 
-    fn linec(&mut self, op: u16) {
+    pub(crate) fn linec(&mut self, op: u16) {
         let dn = ((op >> 9) & 7) as usize;
         let opmode = (op >> 6) & 7;
         let mode = (op >> 3) & 7;
@@ -1403,7 +1447,7 @@ impl Cpu {
 
     // -- line E: shifts (register, long only on ColdFire) --------------------
 
-    fn linee(&mut self, op: u16) {
+    pub(crate) fn linee(&mut self, op: u16) {
         let r = (op & 7) as usize;
         let cnt_field = ((op >> 9) & 7) as u32;
         let count = if op & 0x20 != 0 {
@@ -1458,7 +1502,7 @@ impl Cpu {
 
     // -- line F: cache maintenance, debug, and the missing FPU ---------------
 
-    fn linef(&mut self, op: u16) {
+    pub(crate) fn linef(&mut self, op: u16) {
         match op & 0xFF00 {
             0xF400 => {
                 // CPUSHL / INTOUCH: no cache is modelled.
@@ -1484,18 +1528,27 @@ impl Cpu {
 
     // -- line A: EMAC and MOV3Q ----------------------------------------------
 
-    /// The 48-bit accumulator value in the current mode, sign- or
-    /// zero-extended to 64 bits.
-    pub fn acc_get(&self, i: usize) -> i64 {
-        let acc = self.acc[i] as u64;
-        let hi = (self.accext[i] >> 8) as u64 & 0xFF;
-        let lo = self.accext[i] as u64 & 0xFF;
-        if self.macsr & MACSR_FI != 0 {
+    /// Physical (ACCn, ACCextn) of a 48-bit value under MACSR `m`.
+    fn phys_of(v: i64, m: u32) -> (u32, u16) {
+        let raw = v as u64;
+        if m & MACSR_FI != 0 {
+            ((raw >> 8) as u32, ((((raw >> 40) & 0xFF) << 8) | (raw & 0xFF)) as u16)
+        } else {
+            (raw as u32, ((((raw >> 40) & 0xFF) << 8) | ((raw >> 32) & 0xFF)) as u16)
+        }
+    }
+
+    /// The 48-bit value of physical (ACCn, ACCextn) under MACSR `m`.
+    fn value_of(acc: u32, ext: u16, m: u32) -> i64 {
+        let acc = acc as u64;
+        let hi = (ext >> 8) as u64 & 0xFF;
+        let lo = ext as u64 & 0xFF;
+        if m & MACSR_FI != 0 {
             let raw = (hi << 40) | (acc << 8) | lo;
             ((raw << 16) as i64) >> 16
         } else {
             let raw = (hi << 40) | (lo << 32) | acc;
-            if self.macsr & MACSR_SU == 0 {
+            if m & MACSR_SU == 0 {
                 ((raw << 16) as i64) >> 16
             } else {
                 raw as i64
@@ -1503,15 +1556,41 @@ impl Cpu {
         }
     }
 
-    pub fn acc_set(&mut self, i: usize, v: i64) {
-        let raw = v as u64;
-        if self.macsr & MACSR_FI != 0 {
-            self.acc[i] = (raw >> 8) as u32;
-            self.accext[i] = ((((raw >> 40) & 0xFF) << 8) | (raw & 0xFF)) as u16;
-        } else {
-            self.acc[i] = raw as u32;
-            self.accext[i] = ((((raw >> 40) & 0xFF) << 8) | ((raw >> 32) & 0xFF)) as u16;
+    /// The physical ACCn and ACCextn.
+    pub fn acc_phys(&self, i: usize) -> (u32, u16) {
+        Self::phys_of(self.accv[i], self.macsr)
+    }
+
+    pub fn set_acc_phys(&mut self, i: usize, acc: u32, ext: u16) {
+        self.accv[i] = Self::value_of(acc, ext, self.macsr);
+    }
+
+    /// Write MACSR: the physical registers stay, their meaning changes.
+    pub fn set_macsr(&mut self, v: u32) {
+        let old = self.macsr;
+        let new = v & 0xFFF;
+        if (old ^ new) & (MACSR_FI | MACSR_SU) != 0 {
+            for i in 0..4 {
+                let (a, e) = Self::phys_of(self.accv[i], old);
+                self.accv[i] = Self::value_of(a, e, new);
+            }
         }
+        self.macsr = new;
+    }
+
+    #[inline(always)]
+    pub fn acc_get(&self, i: usize) -> i64 {
+        self.accv[i]
+    }
+
+    /// Store the low 48 bits of `v`, extended as the mode reads them.
+    #[inline(always)]
+    pub fn acc_set(&mut self, i: usize, v: i64) {
+        self.accv[i] = if self.macsr & (MACSR_FI | MACSR_SU) == MACSR_SU {
+            v & ((1i64 << 48) - 1)
+        } else {
+            (v << 16) >> 16
+        };
     }
 
     fn mac_signed_int(&self) -> bool {
@@ -1681,7 +1760,7 @@ impl Cpu {
         }
     }
 
-    fn linea(&mut self, op: u16) {
+    pub(crate) fn linea(&mut self, op: u16) {
         if op & 0x0100 == 0 {
             return self.mac(op);
         }
@@ -1732,8 +1811,7 @@ impl Cpu {
             let v = self.mac_read(i);
             set_rx(self, op & 0xF, v);
             if op & 0x40 != 0 {
-                self.acc[i] = 0;
-                self.accext[i] = 0;
+                self.accv[i] = 0;
                 self.macsr &= !(MACSR_PAV0 << i);
             }
             return;
@@ -1742,8 +1820,7 @@ impl Cpu {
             // MOVE.L ACCy,ACCx
             let src = (op & 3) as usize;
             let dst = ((op >> 9) & 3) as usize;
-            self.acc[dst] = self.acc[src];
-            self.accext[dst] = self.accext[src];
+            self.accv[dst] = self.accv[src];
             self.mac_clear_flags();
             let pav_src = self.macsr & (MACSR_PAV0 << src) != 0;
             self.macsr &= !(MACSR_PAV0 << dst);
@@ -1766,7 +1843,7 @@ impl Cpu {
         if op & 0xFBF0 == 0xAB80 {
             // MOVE.L ACCext01/23,Rx
             let i = if op & 0x400 != 0 { 2 } else { 0 };
-            let v = ((self.accext[i] as u32) << 16) | self.accext[i + 1] as u32;
+            let v = ((self.acc_phys(i).1 as u32) << 16) | self.acc_phys(i + 1).1 as u32;
             set_rx(self, op & 0xF, v);
             return;
         }
@@ -1789,11 +1866,13 @@ impl Cpu {
             self.mac_clear_flags();
             self.mac_set_flags(i);
         } else if op & 0xFFC0 == 0xA900 {
-            self.macsr = val & 0xFFF;
+            self.set_macsr(val);
         } else if op & 0xFBC0 == 0xAB00 {
             let i = if op & 0x400 != 0 { 2 } else { 0 };
-            self.accext[i] = (val >> 16) as u16;
-            self.accext[i + 1] = val as u16;
+            let (a0, _) = self.acc_phys(i);
+            let (a1, _) = self.acc_phys(i + 1);
+            self.set_acc_phys(i, a0, (val >> 16) as u16);
+            self.set_acc_phys(i + 1, a1, val as u16);
         } else if op & 0xFFC0 == 0xAD00 {
             self.mask = val | 0xFFFF_0000;
         } else {
@@ -1804,27 +1883,32 @@ impl Cpu {
     /// MAC / MSAC, with or without a parallel load.
     fn mac(&mut self, op: u16) {
         let ext = self.fetch16();
+        let disp = if op & 0x30 != 0 && (op >> 3) & 7 == 5 { self.fetch16() as i16 as i32 as u32 } else { 0 };
+        self.mac_core(op, ext, disp);
+    }
+
+    /// The body of MAC/MSAC with its extension word (and, for a (d16,An)
+    /// load, the displacement) already fetched.
+    pub fn mac_core(&mut self, op: u16, ext: u16, disp: u32) {
         let mut acc = (((op >> 7) & 1) | ((ext >> 3) & 2)) as usize;
         let load = op & 0x30 != 0;
-        let (rx, ry, mut loadval, mut addr) = if load {
+        let (rx, ry, loadval, addr) = if load {
             let mode = (op >> 3) & 7;
-            let reg = op & 7;
+            let reg = (op & 7) as usize;
             // The EA without (An)+/-(An) side effects; applied after the MAC.
             let base = match mode {
-                2 | 3 => self.a[reg as usize],
-                4 => self.a[reg as usize].wrapping_sub(4),
-                5 => {
-                    let d = self.fetch16() as i16 as i32 as u32;
-                    self.a[reg as usize].wrapping_add(d)
-                }
+                2 | 3 => self.a[reg],
+                4 => self.a[reg].wrapping_sub(4),
+                5 => self.a[reg].wrapping_add(disp),
                 _ => return self.illegal(VEC_LINEA),
             };
             let a = if ext & 0x20 != 0 { base & self.mask } else { base };
             let v = self.bus.read32(a);
             acc ^= 1;
-            let rxn = (ext >> 12) & 7;
-            let rx = if ext & 0x8000 != 0 { self.a[rxn as usize] } else { self.d[rxn as usize] };
-            let ry = if ext & 8 != 0 { self.a[(ext & 7) as usize] } else { self.d[(ext & 7) as usize] };
+            let rxn = ((ext >> 12) & 7) as usize;
+            let rx = if ext & 0x8000 != 0 { self.a[rxn] } else { self.d[rxn] };
+            let ryn = (ext & 7) as usize;
+            let ry = if ext & 8 != 0 { self.a[ryn] } else { self.d[ryn] };
             (rx, ry, v, a)
         } else {
             let rxn = ((op >> 9) & 7) as usize;
@@ -1842,7 +1926,9 @@ impl Cpu {
             };
             self.mac_clear_flags();
             let mut p = self.mac_product(x, y);
-            match (ext >> 9) & 3 {
+            // The scale factor applies in integer modes only (RM 5.3.5).
+            let scale = if self.macsr & MACSR_FI != 0 { 0 } else { (ext >> 9) & 3 };
+            match scale {
                 1 => p = p.wrapping_shl(1),
                 3 => {
                     p = if self.macsr & MACSR_SU != 0 && self.macsr & MACSR_FI == 0 {
@@ -1872,9 +1958,6 @@ impl Cpu {
                 4 => self.a[reg] = addr,
                 _ => {}
             }
-            loadval = 0;
-            addr = 0;
         }
-        let _ = (loadval, addr);
     }
 }

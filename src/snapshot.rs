@@ -74,8 +74,8 @@ pub fn save(m: &Machine, path: &Path) -> std::io::Result<()> {
         ctl: c.ctl.clone(),
         macsr: c.macsr,
         mask: c.mask,
-        acc: c.acc,
-        accext: c.accext,
+        acc: [0, 1, 2, 3].map(|i| c.acc_phys(i).0),
+        accext: [0, 1, 2, 3].map(|i| c.acc_phys(i).1),
         stopped: c.stopped,
         exc_counts: c.exc_counts.to_vec(),
     };
@@ -126,6 +126,7 @@ pub fn load(m: &mut Machine, path: &Path) -> Result<(), String> {
     }
     let c = &mut m.cpu;
     c.bus.ddr = ddr;
+    c.bus.icache_flush();
     c.bus.sram = s.sram;
     c.bus.sparse = s
         .sparse
@@ -156,8 +157,9 @@ pub fn load(m: &mut Machine, path: &Path) -> Result<(), String> {
     c.ctl = r.ctl;
     c.macsr = r.macsr;
     c.mask = r.mask;
-    c.acc = r.acc;
-    c.accext = r.accext;
+    for i in 0..4 {
+        c.set_acc_phys(i, r.acc[i], r.accext[i]);
+    }
     c.stopped = r.stopped;
     for (i, v) in r.exc_counts.iter().enumerate().take(256) {
         c.exc_counts[i] = *v;

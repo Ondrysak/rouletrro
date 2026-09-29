@@ -68,6 +68,9 @@ impl Machine {
         let prof = Profile::for_image(&os.data)?;
         let mut bus = Bus::new(ddr_mb);
         bus.poke_bytes(MAIN_LOAD, &os.data);
+        if std::env::var_os("DTEMU_NO_ICACHE").is_none() {
+            bus.icache_enable(os.data.len() as u32);
+        }
         let mut cpu = Cpu::new(bus);
         cpu.pc = prof.entry;
         cpu.sr = 0x2700;

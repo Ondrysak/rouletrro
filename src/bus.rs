@@ -15,6 +15,7 @@
 //! pages touched that way are recorded, because an unmodelled register the
 //! firmware waits on looks exactly like a firmware bug.
 
+use crate::fast::Op;
 use crate::io::Io;
 use std::collections::{BTreeMap, HashMap};
 
@@ -41,7 +42,21 @@ pub struct Bus {
     /// Set while the eDMA engine runs, so a register write it makes cannot
     /// start the engine again underneath itself.
     pub in_dma: bool,
+    /// The block cache over [CODE_BASE, CODE_BASE + span): halfword ->
+    /// block id (0 = none), the blocks, and which halfwords hold code.
+    blk_map: Vec<u32>,
+    blk_arena: Vec<Box<[Op]>>,
+    code_bits: Vec<u64>,
+    flush_pending: bool,
+    pub icache_flushes: u64,
+    icache_span: u32,
+    pub icache_on: bool,
+    pub icache_decodes: u64,
+    pub icache_invalidations: u64,
 }
+
+/// Where MAIN OS's text starts; the cache covers the image from here.
+pub const CODE_BASE: u32 = 0x4000_0400;
 
 impl Bus {
     pub fn new(ddr_mb: usize) -> Bus {
@@ -59,6 +74,15 @@ impl Bus {
             watch_hits: 0,
             watch_log: Vec::new(),
             in_dma: false,
+            blk_map: Vec::new(),
+            blk_arena: Vec::new(),
+            code_bits: Vec::new(),
+            flush_pending: false,
+            icache_flushes: 0,
+            icache_span: 0,
+            icache_on: false,
+            icache_decodes: 0,
+            icache_invalidations: 0,
         }
     }
 
@@ -66,6 +90,96 @@ impl Bus {
     pub fn ddr_off(&self, addr: u32) -> Option<usize> {
         if addr & 0xC000_0000 == 0x4000_0000 {
             Some((addr & self.ddr_mask) as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Cover `span` bytes of code from CODE_BASE with the block cache.
+    pub fn icache_enable(&mut self, span: u32) {
+        let n = (span / 2) as usize + 1;
+        self.blk_map = vec![0; n];
+        self.code_bits = vec![0; n / 64 + 1];
+        self.blk_arena.clear();
+        self.icache_span = span;
+        self.icache_on = true;
+    }
+
+    /// Drop every block (at the next block boundary, never under one).
+    pub fn icache_flush(&mut self) {
+        self.flush_pending = true;
+    }
+
+    /// Apply a pending flush. Only between blocks.
+    #[inline(always)]
+    pub fn icache_settle(&mut self) {
+        if self.flush_pending {
+            self.flush_pending = false;
+            self.blk_map.iter_mut().for_each(|x| *x = 0);
+            self.code_bits.iter_mut().for_each(|x| *x = 0);
+            self.blk_arena.clear();
+            self.icache_flushes += 1;
+        }
+    }
+
+    /// -> the block starting at `pc`, if one is built.
+    #[inline(always)]
+    pub fn block_at(&self, pc: u32) -> Option<*const [Op]> {
+        let o = pc.wrapping_sub(CODE_BASE);
+        if o >= self.icache_span {
+            return None;
+        }
+        let id = self.blk_map[(o >> 1) as usize];
+        if id == 0 {
+            return None;
+        }
+        Some(&*self.blk_arena[(id - 1) as usize] as *const [Op])
+    }
+
+    #[inline(always)]
+    pub fn in_code_window(&self, pc: u32) -> bool {
+        self.icache_on && pc.wrapping_sub(CODE_BASE) < self.icache_span && pc & 1 == 0
+    }
+
+    /// Record a block that starts at `pc` and covers [pc, end).
+    pub fn block_store(&mut self, pc: u32, end: u32, ops: Box<[Op]>) -> *const [Op] {
+        let o = pc.wrapping_sub(CODE_BASE);
+        self.blk_arena.push(ops);
+        let id = self.blk_arena.len() as u32;
+        self.blk_map[(o >> 1) as usize] = id;
+        let e = end.wrapping_sub(CODE_BASE).min(self.icache_span);
+        for h in (o >> 1)..e.div_ceil(2) {
+            let h = h as usize;
+            self.code_bits[h >> 6] |= 1 << (h & 63);
+        }
+        self.icache_decodes += 1;
+        &**self.blk_arena.last().unwrap() as *const [Op]
+    }
+
+    /// A store to physical DDR offset `o`: if it lands on code some block
+    /// was built from, every block goes (at the next block boundary).
+    #[inline(always)]
+    fn check_code(&mut self, o: u32, n: u32) {
+        let rel = o.wrapping_sub(CODE_BASE - 0x4000_0000);
+        if rel < self.icache_span {
+            let lo = rel >> 1;
+            let hi = ((rel + n).min(self.icache_span) + 1) >> 1;
+            for i in lo..hi {
+                let i = i as usize;
+                if self.code_bits[i >> 6] & (1 << (i & 63)) != 0 {
+                    self.icache_invalidations += 1;
+                    self.flush_pending = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Offset into SRAM for an address in its 0x80000000-0x8BFFFFFF window.
+    #[inline(always)]
+    fn sram_off(addr: u32) -> Option<usize> {
+        if addr.wrapping_sub(SRAM_BASE) < 0x0C00_0000 {
+            Some((addr as usize) & (SRAM_SIZE - 1))
         } else {
             None
         }
@@ -104,6 +218,7 @@ impl Bus {
     /// Plain-memory byte write, bypassing peripherals.
     pub fn poke8(&mut self, addr: u32, v: u8) {
         if let Some(o) = self.ddr_off(addr) {
+            self.check_code(o as u32, 1);
             self.ddr[o] = v;
             return;
         }
@@ -146,6 +261,11 @@ impl Bus {
     pub fn poke_bytes(&mut self, a: u32, data: &[u8]) {
         if let Some(o) = self.ddr_off(a) {
             if o + data.len() <= self.ddr.len() {
+                if self.icache_on {
+                    for k in (0..data.len()).step_by(2) {
+                        self.check_code((o + k) as u32, 2);
+                    }
+                }
                 self.ddr[o..o + data.len()].copy_from_slice(data);
                 return;
             }
@@ -162,6 +282,9 @@ impl Bus {
         if let Some(o) = self.ddr_off(a) {
             return self.ddr[o];
         }
+        if let Some(o) = Self::sram_off(a) {
+            return self.sram[o];
+        }
         self.read_slow(a, 1) as u8
     }
 
@@ -170,6 +293,11 @@ impl Bus {
         if let Some(o) = self.ddr_off(a) {
             if o + 2 <= self.ddr.len() {
                 return u16::from_be_bytes([self.ddr[o], self.ddr[o + 1]]);
+            }
+        }
+        if let Some(o) = Self::sram_off(a) {
+            if o + 2 <= SRAM_SIZE {
+                return u16::from_be_bytes([self.sram[o], self.sram[o + 1]]);
             }
         }
         self.read_slow(a, 2) as u16
@@ -182,6 +310,11 @@ impl Bus {
                 return u32::from_be_bytes(self.ddr[o..o + 4].try_into().unwrap());
             }
         }
+        if let Some(o) = Self::sram_off(a) {
+            if o + 4 <= SRAM_SIZE {
+                return u32::from_be_bytes(self.sram[o..o + 4].try_into().unwrap());
+            }
+        }
         self.read_slow(a, 4)
     }
 
@@ -189,7 +322,12 @@ impl Bus {
     pub fn write8(&mut self, a: u32, v: u8) {
         if let Some(o) = self.ddr_off(a) {
             self.check_watch(a, 1, v as u32);
+            self.check_code(o as u32, 1);
             self.ddr[o] = v;
+            return;
+        }
+        if let Some(o) = Self::sram_off(a) {
+            self.sram[o] = v;
             return;
         }
         self.write_slow(a, 1, v as u32)
@@ -200,7 +338,14 @@ impl Bus {
         if let Some(o) = self.ddr_off(a) {
             if o + 2 <= self.ddr.len() {
                 self.check_watch(a, 2, v as u32);
+                self.check_code(o as u32, 2);
                 self.ddr[o..o + 2].copy_from_slice(&v.to_be_bytes());
+                return;
+            }
+        }
+        if let Some(o) = Self::sram_off(a) {
+            if o + 2 <= SRAM_SIZE {
+                self.sram[o..o + 2].copy_from_slice(&v.to_be_bytes());
                 return;
             }
         }
@@ -212,7 +357,14 @@ impl Bus {
         if let Some(o) = self.ddr_off(a) {
             if o + 4 <= self.ddr.len() {
                 self.check_watch(a, 4, v);
+                self.check_code(o as u32, 4);
                 self.ddr[o..o + 4].copy_from_slice(&v.to_be_bytes());
+                return;
+            }
+        }
+        if let Some(o) = Self::sram_off(a) {
+            if o + 4 <= SRAM_SIZE {
+                self.sram[o..o + 4].copy_from_slice(&v.to_be_bytes());
                 return;
             }
         }
