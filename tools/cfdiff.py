@@ -61,7 +61,7 @@ class Gen:
         kind = r.choice(allow)
         reg = r.randrange(8)
         if kind in ('ind', 'post', 'pre', 'd16', 'idx'):
-            reg = r.randrange(6)          # a0-a5 point at data
+            reg = r.choice([0, 1, 2, 3, 4, 5, 7])   # a0-a5 and the stack point at data
         if kind == 'd':
             return (0 << 3) | reg, b''
         if kind == 'a':

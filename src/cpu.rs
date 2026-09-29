@@ -51,6 +51,8 @@ pub enum Stop {
     Hook(u32),
     /// The core is in STOP and no interrupt can wake it before the budget.
     Stopped,
+    /// A peripheral event is due (`io.deadline` reached).
+    Event,
     /// An exception whose vector is empty or points nowhere sensible.
     Fault(u8, u32),
 }
@@ -83,8 +85,6 @@ pub struct Cpu {
     pub accext: [u16; 4],
 
     pub stopped: bool,
-    /// Instructions executed (plus idle credit, see `run`).
-    pub icount: u64,
     /// Address of the instruction being executed.
     pub op_pc: u32,
     pub bus: Bus,
@@ -92,11 +92,16 @@ pub struct Cpu {
     /// One bit per halfword of the hooked code window.
     hook_bits: Vec<u64>,
     hook_base: u32,
-    /// Let the instruction at a hooked PC execute once without stopping.
-    pub skip_hook: bool,
+    /// Let the instruction at this hooked PC execute once without stopping.
+    /// Tied to the address, so an interrupt taken first cannot consume it.
+    pub skip_hook: Option<u32>,
     pub last_fault: Option<(u8, u32)>,
     /// Count of exceptions raised by vector, for diagnostics.
     pub exc_counts: [u64; 256],
+    /// A ring of the last executed PCs, when enabled (debugging).
+    pub history: Option<(Vec<u32>, usize)>,
+    /// The first few faults: (vector, pc, opcode, clock).
+    pub fault_log: Vec<(u8, u32, u16, u64)>,
 }
 
 const HOOK_WINDOW: u32 = 0x0080_0000; // 8 MB of code from hook_base
@@ -144,14 +149,15 @@ impl Cpu {
             acc: [0; 4],
             accext: [0; 4],
             stopped: false,
-            icount: 0,
             op_pc: 0,
             bus,
             hook_bits: vec![0; (HOOK_WINDOW / 2 / 64) as usize],
             hook_base: 0x4000_0000,
-            skip_hook: false,
+            skip_hook: None,
             last_fault: None,
             exc_counts: [0; 256],
+            fault_log: Vec::new(),
+            history: None,
         }
     }
 
@@ -315,15 +321,16 @@ impl Cpu {
             0 => Loc::D(r),
             1 => Loc::A(r),
             2 => Loc::M(self.a[r]),
+            // ColdFire keeps no word alignment for A7: a byte access through
+            // (A7)+ or -(A7) moves it by one (the 680x0 rule of two does not
+            // apply; QEMU gates it on the 680x0 feature).
             3 => {
                 let a = self.a[r];
-                let inc = if r == 7 && sz == 1 { 2 } else { sz };
-                self.a[r] = a.wrapping_add(inc);
+                self.a[r] = a.wrapping_add(sz);
                 Loc::M(a)
             }
             4 => {
-                let dec = if r == 7 && sz == 1 { 2 } else { sz };
-                let a = self.a[r].wrapping_sub(dec);
+                let a = self.a[r].wrapping_sub(sz);
                 self.a[r] = a;
                 Loc::M(a)
             }
@@ -446,14 +453,24 @@ impl Cpu {
 
     fn illegal(&mut self, vec: u8) {
         let pc = self.op_pc;
+        if self.fault_log.len() < 32 {
+            let op = self.bus.peek16(pc);
+            self.fault_log.push((vec, pc, op, self.bus.io.now));
+        }
         self.last_fault = Some((vec, pc));
         self.exception(vec, pc, None);
     }
 
     // -- the run loop -----------------------------------------------------
 
-    /// Execute until `icount` reaches `until`, a hook is hit, or the core
-    /// stops with nothing to wake it.
+    /// Instructions executed so far: the machine's clock.
+    #[inline(always)]
+    pub fn icount(&self) -> u64 {
+        self.bus.io.now
+    }
+
+    /// Execute until the clock reaches `until`, a peripheral event falls
+    /// due, a hook is hit, or the core stops with nothing to wake it.
     pub fn run(&mut self, until: u64) -> Stop {
         loop {
             // Interrupts are sampled between instructions.
@@ -464,22 +481,31 @@ impl Cpu {
                     self.exception(vec, pc, Some(level));
                 }
             }
-            if self.icount >= until {
+            let now = self.bus.io.now;
+            if now >= until {
                 return Stop::Budget;
+            }
+            if now >= self.bus.io.deadline {
+                return Stop::Event;
             }
             if self.stopped {
                 return Stop::Stopped;
             }
             let pc = self.pc;
             if self.hooked(pc) {
-                if !self.skip_hook {
+                if self.skip_hook != Some(pc) {
                     return Stop::Hook(pc);
                 }
-                self.skip_hook = false;
+                self.skip_hook = None;
             }
             self.op_pc = pc;
             self.bus.pc = pc;
-            self.icount += 1;
+            self.bus.io.now = now + 1;
+            if let Some((h, i)) = &mut self.history {
+                let n = h.len();
+                h[*i % n] = pc;
+                *i += 1;
+            }
             self.execute();
             if let Some((v, p)) = self.last_fault.take() {
                 let h = self.bus.peek32(self.vbr.wrapping_add(v as u32 * 4));
@@ -495,7 +521,7 @@ impl Cpu {
         let pc = self.pc;
         self.op_pc = pc;
         self.bus.pc = pc;
-        self.icount += 1;
+        self.bus.io.now += 1;
         self.execute();
     }
 

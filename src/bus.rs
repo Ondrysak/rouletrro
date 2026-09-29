@@ -33,9 +33,14 @@ pub struct Bus {
     pub io: Io,
     /// The PC of the instruction being executed, for diagnostics.
     pub pc: u32,
-    /// Set when a write lands in watched code, so any decoded cache is flushed.
+    /// A DDR write watchpoint: [lo, hi) as physical offsets. Hits are logged
+    /// as (pc, address, size, value).
     pub watch: Option<(u32, u32)>,
     pub watch_hits: u64,
+    pub watch_log: Vec<(u32, u32, u32, u32)>,
+    /// Set while the eDMA engine runs, so a register write it makes cannot
+    /// start the engine again underneath itself.
+    pub in_dma: bool,
 }
 
 impl Bus {
@@ -52,6 +57,8 @@ impl Bus {
             pc: 0,
             watch: None,
             watch_hits: 0,
+            watch_log: Vec::new(),
+            in_dma: false,
         }
     }
 
@@ -181,7 +188,7 @@ impl Bus {
     #[inline(always)]
     pub fn write8(&mut self, a: u32, v: u8) {
         if let Some(o) = self.ddr_off(a) {
-            self.check_watch(a, 1);
+            self.check_watch(a, 1, v as u32);
             self.ddr[o] = v;
             return;
         }
@@ -192,7 +199,7 @@ impl Bus {
     pub fn write16(&mut self, a: u32, v: u16) {
         if let Some(o) = self.ddr_off(a) {
             if o + 2 <= self.ddr.len() {
-                self.check_watch(a, 2);
+                self.check_watch(a, 2, v as u32);
                 self.ddr[o..o + 2].copy_from_slice(&v.to_be_bytes());
                 return;
             }
@@ -204,7 +211,7 @@ impl Bus {
     pub fn write32(&mut self, a: u32, v: u32) {
         if let Some(o) = self.ddr_off(a) {
             if o + 4 <= self.ddr.len() {
-                self.check_watch(a, 4);
+                self.check_watch(a, 4, v);
                 self.ddr[o..o + 4].copy_from_slice(&v.to_be_bytes());
                 return;
             }
@@ -213,11 +220,14 @@ impl Bus {
     }
 
     #[inline(always)]
-    fn check_watch(&mut self, a: u32, n: u32) {
+    fn check_watch(&mut self, a: u32, n: u32, v: u32) {
         if let Some((lo, hi)) = self.watch {
             let o = a & self.ddr_mask;
             if o + n > lo && o < hi {
                 self.watch_hits += 1;
+                if self.watch_log.len() < 4096 {
+                    self.watch_log.push((self.pc, a, n, v));
+                }
             }
         }
     }
@@ -275,6 +285,9 @@ impl Bus {
             let pc = self.pc;
             let (io, ddr) = (&mut self.io, &mut self.ddr);
             if io.write(a, size, v, pc, ddr) {
+                if self.io.edma.kick != 0 && !self.in_dma {
+                    self.run_dma();
+                }
                 return;
             }
         }
