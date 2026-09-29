@@ -129,16 +129,21 @@ impl Card {
         if !self.dirty {
             return Ok(());
         }
-        let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&p)?;
-        let zero = [0u8; 512];
-        let mut last = 0u32;
-        for (&s, data) in &self.sectors {
-            f.seek(SeekFrom::Start(s as u64 * 512))?;
-            f.write_all(&data[..])?;
-            last = last.max(s + 1);
+        // Written beside the image and renamed over it, so a failed write
+        // never leaves a half-written card. All-zero sectors stay holes.
+        let tmp = p.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            let mut last = 0u32;
+            for (&s, data) in &self.sectors {
+                f.seek(SeekFrom::Start(s as u64 * 512))?;
+                f.write_all(&data[..])?;
+                last = last.max(s + 1);
+            }
+            f.set_len(last as u64 * 512)?;
+            f.sync_all()?;
         }
-        let _ = zero;
-        f.set_len(last as u64 * 512)?;
+        std::fs::rename(&tmp, &p)?;
         self.dirty = false;
         Ok(())
     }

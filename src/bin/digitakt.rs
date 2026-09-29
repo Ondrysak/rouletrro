@@ -34,6 +34,9 @@ struct Audio {
     dropouts: AtomicU64,
     rate: AtomicU64,
     live: AtomicBool,
+    /// Set once the emulator first fills the ring; until then the output
+    /// plays silence and counts no dropouts.
+    primed: AtomicBool,
 }
 
 struct Opts {
@@ -49,6 +52,8 @@ struct Opts {
     card: Option<PathBuf>,
     audio_null: bool,
     wav: Option<PathBuf>,
+    /// Audio kept buffered ahead of the output, in ms.
+    latency: f64,
 }
 
 fn parse() -> Opts {
@@ -65,6 +70,7 @@ fn parse() -> Opts {
         card: None,
         audio_null: false,
         wav: None,
+        latency: 60.0,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut it = args.iter();
@@ -76,6 +82,7 @@ fn parse() -> Opts {
             "--audio-null" => o.audio_null = true,
             "--card" => o.card = it.next().map(PathBuf::from),
             "--wav" => o.wav = it.next().map(PathBuf::from),
+            "--latency" => o.latency = it.next().unwrap().parse().expect("--latency MS"),
             "--turn" => {
                 let v = it.next().unwrap();
                 let (ed, t) = v.split_once('@').expect("--turn ENC:DELTA@SECS");
@@ -94,7 +101,7 @@ fn parse() -> Opts {
                 println!(
                     "usage: digitakt [FIRMWARE.syx] [--snapshot FILE] [--card IMAGE] [--ips N] [--no-audio]\n\
                      \x20                [--headless --after SECS --screenshot OUT.png] [--press CODE@SECS] [--turn ENC:DELTA@SECS]\n\
-                     \x20                [--audio-null] [--wav OUT.wav]"
+                     \x20                [--latency MS] [--audio-null] [--wav OUT.wav]"
                 );
                 std::process::exit(0);
             }
@@ -125,7 +132,7 @@ fn emulate(
     let ips = o.ips;
     m.cpu.bus.io.ips = ips;
     let slice = (ips / 500.0) as u64; // 2 ms of emulated time
-    let target_ms = 60.0;
+    let target_ms = o.latency;
     let t0 = Instant::now();
     let emu0 = m.now();
     let mut last_pub = Instant::now();
@@ -139,6 +146,7 @@ fn emulate(
                 Ev::Turn(e, d) => m.turn(e, d),
                 Ev::ReleaseAll => m.release_all_keys(),
                 Ev::Save => {
+                    save_card(&mut m, o);
                     if let Some(p) = &o.snapshot {
                         match dtemu::snapshot::save(&m, p) {
                             Ok(()) => eprintln!("saved {}", p.display()),
@@ -152,6 +160,9 @@ fn emulate(
         let live = audio.live.load(Ordering::Relaxed);
         if live {
             let buffered = audio.ring.lock().unwrap().len() as f64 / 2.0 / rate * 1000.0;
+            if buffered > target_ms / 2.0 {
+                audio.primed.store(true, Ordering::Relaxed);
+            }
             if buffered > target_ms {
                 std::thread::sleep(Duration::from_micros(500));
                 continue;
@@ -219,6 +230,12 @@ fn start_null_audio(audio: Arc<Audio>, keep: Option<Arc<Mutex<Vec<f32>>>>) {
             let due = (t0.elapsed().as_secs_f64() * 48_000.0) as u64;
             let n = (due - played) as usize;
             played = due;
+            if !audio.primed.load(Ordering::Relaxed) {
+                if let Some(k) = &keep {
+                    k.lock().unwrap().extend(std::iter::repeat_n(0.0, n * 2));
+                }
+                continue;
+            }
             let mut ring = audio.ring.lock().unwrap();
             if ring.len() < n * 2 {
                 audio.dropouts.fetch_add(1, Ordering::Relaxed);
@@ -255,6 +272,10 @@ fn start_audio(audio: Arc<Audio>) -> Option<cpal::Stream> {
         .build_output_stream(
             &cfg.config(),
             move |data: &mut [f32], _| {
+                if !a.primed.load(Ordering::Relaxed) {
+                    data.fill(0.0);
+                    return;
+                }
                 let mut ring = a.ring.lock().unwrap();
                 let frames = data.len() / channels;
                 if ring.len() < frames * 2 {
@@ -292,10 +313,22 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1)
     });
+    // The card first: a snapshot then brings its own sectors (the firmware's
+    // cached view of the drive matches those) and keeps the image path.
+    if let Some(c) = &o.card {
+        match m.attach_card(c) {
+            Ok(()) => eprintln!("card {}", c.display()),
+            Err(e) => eprintln!("{}: {e}; using a blank card", c.display()),
+        }
+    }
     if let Some(p) = &o.snapshot {
         if p.exists() {
             match dtemu::snapshot::load(&mut m, p) {
-                Ok(()) => eprintln!("resumed {}", p.display()),
+                Ok(()) => {
+                    eprintln!("resumed {}", p.display());
+                    let card = &mut m.cpu.bus.io.esdhc.card;
+                    card.dirty = card.path.is_some();
+                }
                 Err(e) => eprintln!("{}: {e}; booting from reset", p.display()),
             }
         }
@@ -306,13 +339,8 @@ fn main() {
         dropouts: AtomicU64::new(0),
         rate: AtomicU64::new(48_000),
         live: AtomicBool::new(false),
+        primed: AtomicBool::new(false),
     });
-    if let Some(c) = &o.card {
-        match m.attach_card(c) {
-            Ok(()) => eprintln!("card {}", c.display()),
-            Err(e) => eprintln!("{}: {e}; using a blank card", c.display()),
-        }
-    }
     let kept: Option<Arc<Mutex<Vec<f32>>>> = o.wav.as_ref().map(|_| Arc::new(Mutex::new(Vec::new())));
     let _stream = if o.audio_null {
         start_null_audio(audio.clone(), kept.clone());
@@ -375,7 +403,8 @@ fn main() {
             std::thread::sleep(Duration::from_millis(10));
         }
         quit.store(true, Ordering::Relaxed);
-        let m = th.join().unwrap();
+        let mut m = th.join().unwrap();
+        save_card(&mut m, &opts);
         let v = view_of(&m, format!("HEADLESS, T {:.1} S", m.now() as f64 / opts.ips));
         gui::draw(&mut cv, &v, &places, &[], &[]);
         if let Some(p) = &opts.screenshot {
@@ -392,7 +421,8 @@ fn main() {
     }
     run_window(&opts, tx, view, quit.clone(), &places, &mut cv);
     quit.store(true, Ordering::Relaxed);
-    let m = th.join().unwrap();
+    let mut m = th.join().unwrap();
+    save_card(&mut m, &opts);
     if let Some(p) = &opts.snapshot {
         match dtemu::snapshot::save(&m, p) {
             Ok(()) => eprintln!("saved {}", p.display()),
@@ -499,6 +529,18 @@ fn run_window(o: &Opts, tx: mpsc::Sender<Ev>, view: Arc<Mutex<View>>, _quit: Arc
         }
         if win.update_with_buffer(&cv.px, cv.w, cv.h).is_err() {
             break;
+        }
+    }
+}
+
+/// Write the card back to its image, if it has one and it changed.
+fn save_card(m: &mut Machine, o: &Opts) {
+    if let Some(c) = &o.card {
+        let dirty = m.cpu.bus.io.esdhc.card.dirty;
+        match m.flush_card() {
+            Ok(()) if dirty => eprintln!("wrote card {}", c.display()),
+            Ok(()) => {}
+            Err(e) => eprintln!("{}: {e}", c.display()),
         }
     }
 }
