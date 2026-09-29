@@ -18,6 +18,10 @@ fn main() {
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" => out = it.next().map(PathBuf::from),
+            "-h" | "--help" => {
+                println!("usage: fwinfo FIRMWARE.syx [-o DIR]");
+                return;
+            }
             _ => syx = Some(PathBuf::from(a)),
         }
     }

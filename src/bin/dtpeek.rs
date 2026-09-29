@@ -1,12 +1,16 @@
 //! Inspect a snapshot: registers, TCDs, memory.
 //!
-//!     dtpeek SNAPSHOT tcd N | mem ADDR LEN | fb
+//!     dtpeek SNAPSHOT tcd N | mem ADDR LEN | leds | uart [FROM] | replay | fb
 
 use dtemu::firmware::Firmware;
 use dtemu::machine::Machine;
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
+    if a.len() < 2 || a[0] == "-h" || a[0] == "--help" {
+        println!("usage: dtpeek SNAPSHOT tcd N | mem ADDR LEN | leds | uart [FROM] | replay | fb");
+        return;
+    }
     let fw = Firmware::from_file(std::path::Path::new("fw/Digitakt_OS1.53.syx")).unwrap();
     let mut m = Machine::new(&fw, 128).unwrap();
     dtemu::snapshot::load(&mut m, std::path::Path::new(&a[0])).unwrap();

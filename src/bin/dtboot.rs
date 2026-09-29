@@ -1,6 +1,6 @@
 //! Headless boot: run the firmware and report progress.
 //!
-//!     dtboot FIRMWARE.syx [--instr N] [--every N] [--ips N] [--no-masks]
+//!     dtboot [FIRMWARE.syx] [options]   (see --help)
 
 use dtemu::cpu::Stop;
 use dtemu::firmware::Firmware;
@@ -17,6 +17,37 @@ fn num(s: &str) -> u64 {
     };
     n.parse::<f64>().map(|v| (v * mul as f64) as u64).expect("number")
 }
+
+const USAGE: &str = "\
+usage: dtboot [FIRMWARE.syx] [options]
+
+Runs the firmware headless and reports progress. Clocks are instruction
+counts (suffixes k, M, G).
+
+  --instr N            run N instructions (default 100M)
+  --every N            report every N (default 10M)
+  --ips N              instructions per emulated second (default 200M)
+  --load SNAP          resume a snapshot
+  --save SNAP          save a snapshot at the end
+  --card IMAGE         back the eMMC with an image file
+  --press CODE@AT[:HOLD]
+                       press key CODE at clock AT for HOLD (default 30M)
+  --turn ENC:DELTA@ATxCOUNT[/SPACING]
+                       turn encoder ENC by DELTA, COUNT times, SPACING apart
+  --wav OUT.wav        record the audio output
+  --break ADDR         stop at a PC (hex); --break-after N arms it after N
+  --watch ADDR         log writes to a DDR address (hex)
+  --count ADDR         count visits to a PC (hex)
+  --trace N            keep the last N PCs for fault reports
+  --profile-after N    sample guest PCs from clock N on
+  --no-masks           ignore interrupt masks
+
+Environment:
+  DTBOOT_OLED          end with the panel MCU's OLED, not the last captured frame
+  DTBOOT_STEPS         after each key release, settle 40M and show the screen
+                       (as PNGs in DTBOOT_PNG_DIR if set)
+  DTBOOT_TURN_PNG=DIR  a PNG after each turn, DTBOOT_TURN_SETTLE (3M) later
+";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -46,6 +77,10 @@ fn main() {
             "--every" => every = num(it.next().unwrap()),
             "--ips" => ips = Some(num(it.next().unwrap())),
             "--no-masks" => no_masks = true,
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return;
+            }
             "--break" => {
                 let a = u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap();
                 breaks.push(a);
