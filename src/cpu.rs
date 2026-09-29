@@ -556,15 +556,22 @@ impl Cpu {
         // SAFETY: blocks are boxed and only dropped by `icache_settle`,
         // which runs between blocks, never while one executes.
         let ops: &[crate::fast::Op] = unsafe { &*blk };
+        // `bus.pc` only labels debug logs: exact under a watchpoint, the
+        // block's start otherwise. STOP ends its block, so `stopped` needs
+        // no check here.
+        self.bus.pc = pc;
+        let exact = self.bus.watch.is_some();
         let mut pc = pc;
         for op in ops {
             self.op_pc = pc;
-            self.bus.pc = pc;
+            if exact {
+                self.bus.pc = pc;
+            }
             self.bus.io.now += 1;
             let next = pc.wrapping_add(op.len as u32);
             self.pc = next;
             (op.h)(self, op);
-            if self.pc != next || self.stopped {
+            if self.pc != next {
                 break;
             }
             pc = next;

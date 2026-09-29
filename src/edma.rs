@@ -136,7 +136,7 @@ impl Bus {
 
     /// One minor loop. -> false if the channel has nothing left to do.
     fn dma_minor(&mut self, ch: usize) -> bool {
-        let mut t = self.tcd(ch);
+        let t = self.tcd(ch);
         let citer = Tcd::count(t.citer);
         if citer == 0 {
             return false;
@@ -150,10 +150,36 @@ impl Bus {
             nbytes = 1 << 30;
         }
         let nbytes = nbytes.min(1 << 22);
-        let mut buf: Vec<u8> = Vec::with_capacity(nbytes as usize);
         let soff = t.soff as i16 as i32 as u32;
         let doff = t.doff as i16 as i32 as u32;
         let (mut s, mut d) = (t.saddr, t.daddr);
+        if ssize == dsize {
+            // Equal sizes: each read goes straight to its write.
+            let unit = ssize.min(4);
+            let mut moved = 0;
+            while moved < nbytes {
+                for k in 0..ssize / unit {
+                    let v = self.dma_read(s.wrapping_add(k * unit), unit);
+                    self.dma_write(d.wrapping_add(k * unit), unit, v);
+                }
+                moved += ssize;
+                s = modulo_add(s, soff, smod);
+                d = modulo_add(d, doff, dmod);
+            }
+            return self.dma_minor_done(ch, citer, s, d);
+        }
+        // Reads round up to whole source units; the audio's loops fit on
+        // the stack.
+        let cap = (nbytes + ssize) as usize;
+        let mut stack = [0u8; 96];
+        let mut heap = Vec::new();
+        let buf: &mut [u8] = if cap <= stack.len() {
+            &mut stack
+        } else {
+            heap.resize(cap, 0);
+            &mut heap
+        };
+        let mut len = 0usize;
         let mut moved = 0;
         while moved < nbytes {
             // A 16- or 32-byte burst moves as a run of longwords.
@@ -161,14 +187,15 @@ impl Bus {
             for k in 0..ssize / unit {
                 let v = self.dma_read(s.wrapping_add(k * unit), unit);
                 for b in (0..unit).rev() {
-                    buf.push((v >> (8 * b)) as u8);
+                    buf[len] = (v >> (8 * b)) as u8;
+                    len += 1;
                 }
             }
             moved += ssize;
             s = modulo_add(s, soff, smod);
         }
         let mut written = 0;
-        while written + dsize <= buf.len() as u32 {
+        while written + dsize <= len as u32 {
             let unit = dsize.min(4);
             for k in 0..dsize / unit {
                 let off = (written + k * unit) as usize;
@@ -181,7 +208,13 @@ impl Bus {
             written += dsize;
             d = modulo_add(d, doff, dmod);
         }
-        t = self.tcd(ch); // the transfer may have touched TCD space
+        self.dma_minor_done(ch, citer, s, d)
+    }
+
+    /// Minor loop bookkeeping: the new addresses and count, the half and
+    /// major completions, the minor link.
+    fn dma_minor_done(&mut self, ch: usize, citer: u16, s: u32, d: u32) -> bool {
+        let mut t = self.tcd(ch); // the transfer may have touched TCD space
         t.saddr = s;
         t.daddr = d;
         let new_count = citer - 1;
