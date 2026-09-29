@@ -13,6 +13,8 @@
 //! EXT_CSD identity bytes and the sector count against the same row. The
 //! values below are that table's own (reference project, esdhc.py `PART`).
 
+use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -41,9 +43,12 @@ const ID_B: u8 = 0x01;
 const ID_C: u8 = 0x08;
 
 /// Sparse sector storage with an optional backing file.
+#[derive(Serialize, Deserialize)]
 pub struct Card {
+    #[serde(with = "sector_map")]
     pub sectors: BTreeMap<u32, Box<[u8; 512]>>,
     pub capacity: u32,
+    #[serde(with = "BigArray")]
     pub ext_csd: [u8; 512],
     pub cid: [u32; 4],
     pub rca: u32,
@@ -173,7 +178,7 @@ impl Default for Card {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
 enum Phase {
     Idle,
     /// Card -> host: `rx` holds what is left to read.
@@ -182,7 +187,9 @@ enum Phase {
     Write,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Esdhc {
+    #[serde(with = "BigArray")]
     pub regs: [u32; 0x40],
     pub card: Card,
     rx: VecDeque<u8>,
@@ -438,5 +445,26 @@ impl Esdhc {
             _ => self.set(off, v),
         }
         true
+    }
+}
+
+mod sector_map {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(m: &BTreeMap<u32, Box<[u8; 512]>>, s: S) -> Result<S::Ok, S::Error> {
+        let v: Vec<(u32, &[u8])> = m.iter().map(|(k, d)| (*k, &d[..])).collect();
+        v.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<u32, Box<[u8; 512]>>, D::Error> {
+        let v: Vec<(u32, Vec<u8>)> = Vec::deserialize(d)?;
+        Ok(v.into_iter()
+            .map(|(k, d)| {
+                let mut b = Box::new([0u8; 512]);
+                b[..d.len().min(512)].copy_from_slice(&d[..d.len().min(512)]);
+                (k, b)
+            })
+            .collect())
     }
 }

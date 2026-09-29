@@ -30,6 +30,9 @@ fn main() {
     let mut trace = 0usize;
     let mut break_after = 0u64;
     let mut counts: Vec<u32> = Vec::new();
+    let mut profile_after: Option<u64> = None;
+    let mut save: Option<String> = None;
+    let mut load: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -41,6 +44,9 @@ fn main() {
                 let a = u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap();
                 breaks.push(a);
             }
+            "--save" => save = it.next().cloned(),
+            "--load" => load = it.next().cloned(),
+            "--profile-after" => profile_after = Some(num(it.next().unwrap())),
             "--count" => {
                 let a = u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap();
                 counts.push(a);
@@ -77,11 +83,21 @@ fn main() {
         let o = a & 0x07FF_FFFF;
         m.cpu.bus.watch = Some((o, o + 4));
     }
+    if let Some(p) = &load {
+        dtemu::snapshot::load(&mut m, std::path::Path::new(p)).unwrap();
+        println!("restored {p} at clock {}", m.now());
+        instr += m.now();
+    }
     let t0 = Instant::now();
     let mut logged = 0;
-    let mut target = 0;
+    let mut target = m.now();
     while target < instr {
         target = (target + every).min(instr);
+        if let Some(pa) = profile_after {
+            if m.now() >= pa && m.cpu.profile.is_none() {
+                m.cpu.profile = Some(Default::default());
+            }
+        }
         let stop = m.run_until(target);
         for l in &m.log[logged..] {
             println!("{l}");
@@ -131,8 +147,12 @@ fn main() {
             break;
         }
     }
+    if let Some(p) = &save {
+        dtemu::snapshot::save(&m, std::path::Path::new(p)).unwrap();
+        println!("saved {p} ({} bytes)", std::fs::metadata(p).unwrap().len());
+    }
     let secs = t0.elapsed().as_secs_f64();
-    let executed = m.now() - m.stats.idle_skipped;
+    let executed = m.now().saturating_sub(m.stats.idle_skipped);
     println!(
         "{} instructions ({} executed, {} idle-skipped) in {:.2}s = {:.1} MIPS executed",
         m.now(),
@@ -151,6 +171,19 @@ fn main() {
     print!("{}", m.task_report());
     let vt: Vec<String> = [97u32, 99, 154, 155, 180, 191, 192, 205, 207, 208, 223].iter().map(|v| format!("v{v}={:08x}", m.cpu.bus.peek32(m.cpu.vbr + v * 4))).collect();
     println!("vectors: {}", vt.join(" "));
+    if let Some(p) = &m.cpu.profile {
+        let total: u64 = p.values().sum();
+        let mut by_fn: std::collections::HashMap<u32, u64> = Default::default();
+        for (pc, n) in p {
+            *by_fn.entry(pc & !0xFF).or_insert(0) += n;
+        }
+        let mut v: Vec<_> = by_fn.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("guest profile ({total} samples), by 256-byte region:");
+        for (a, n) in v.iter().take(25) {
+            println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total as f64);
+        }
+    }
     let c = &m.cpu;
     for (pc, a, n, v) in c.bus.watch_log.iter().take(40) {
         println!("watch: pc={pc:08x} [{a:08x}].{n} <- {v:08x}");
@@ -173,6 +206,10 @@ fn main() {
     for (i, d) in c.bus.io.dtim.iter().enumerate() {
         println!("dtim{i}: dtmr={:04x} dter={:02x} dtrr={:08x} fired={}", d.dtmr, d.dter, d.dtrr, d.fired);
     }
+    let ssi = &c.bus.io.ssi;
+    let nz = ssi.out.iter().filter(|&&x| x != 0).count();
+    let peak = ssi.out.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0);
+    println!("ssi: frames={} buffered={} nonzero={} peak={} tx_pending={}", ssi.frames, ssi.out.len(), nz, peak, ssi.tx_pending);
     println!("edma: erq={:016x} int={:016x} majors[34]={} [35]={} [59]={}", c.bus.io.edma.erq, c.bus.io.edma.int, c.bus.io.edma.majors[34], c.bus.io.edma.majors[35], c.bus.io.edma.majors[59]);
     if let Some(f) = &m.frame {
         print!("{}", Machine::frame_ascii(f));

@@ -8,6 +8,8 @@
 //! Interrupt lines are level-sensitive, as on the silicon: a source stays
 //! asserted until the firmware's handler clears the flag that raised it.
 
+use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 use std::collections::{HashMap, VecDeque};
 
 pub const F_BUS: f64 = 132_000_000.0;
@@ -32,10 +34,11 @@ pub const SRC_ESDHC: Src = (2, 31);
 
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Intc {
     pub imr: u64,
     pub frc: u64,
+    #[serde(with = "BigArray")]
     pub icr: [u8; 64],
     pub iconfig: u16,
     /// Device lines, recomputed by `Io::update_irq`.
@@ -49,9 +52,21 @@ impl Intc {
     fn pending(&self) -> u64 {
         self.lines | self.frc
     }
+
+    /// What can interrupt the CPU. Software-forced sources are not gated by
+    /// IMR: OS 1.53 raises INTC1 source 63 (the audio render) and INTC0
+    /// sources 44 and 57 (the sequencer tick) only through INTFRC and never
+    /// unmasks them, having masked every source at reset.
+    fn deliverable(&self, ignore_masks: bool) -> u64 {
+        if ignore_masks {
+            self.pending()
+        } else {
+            (self.lines & !self.imr) | self.frc
+        }
+    }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Pit {
     pub pcsr: u16,
     pub pmr: u16,
@@ -69,7 +84,7 @@ const PIT_PIF: u16 = 0x04;
 const PIT_PIE: u16 = 0x08;
 const PIT_OVW: u16 = 0x10;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Dtim {
     pub dtmr: u16,
     pub dtxmr: u8,
@@ -81,7 +96,7 @@ pub struct Dtim {
     pub fired: u64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Uart {
     pub umr: [u8; 2],
     pub umr_ptr: usize,
@@ -94,7 +109,7 @@ pub struct Uart {
 }
 
 /// eDMA controller registers; transfers run in `crate::edma` on the bus.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Edma {
     pub cr: u32,
     pub erq: u64,
@@ -105,12 +120,38 @@ pub struct Edma {
     /// Channels with a software start or hardware request waiting.
     pub kick: u64,
     /// Channel -> instruction time before which it may not run again.
+    #[serde(with = "BigArray")]
     pub busy_until: [u64; 64],
     /// Channels that asked while busy, re-offered by the service loop.
     pub deferred: u64,
+    #[serde(with = "BigArray")]
     pub majors: [u64; 64],
 }
 
+/// SSI1, the codec interface. Each frame at `rate` asks eDMA channel 54
+/// (transmit, 8 bytes: a stereo pair) and channel 52 (receive) for a minor
+/// loop; words written to STX0/STX1 are the output samples, 24-bit and
+/// right-justified.
+#[derive(Serialize, Deserialize)]
+pub struct Ssi {
+    pub rate: f64,
+    pub next: Option<f64>,
+    pub tx_pending: u32,
+    pub rx_pending: u32,
+    pub frames: u64,
+    /// Output samples (interleaved L/R), until someone drains them.
+    pub out: VecDeque<i32>,
+    pub out_cap: usize,
+    /// Input samples fed to SRX0 (interleaved L/R).
+    pub input: VecDeque<i32>,
+    pub regs: [u32; 16],
+    pub enabled: bool,
+}
+
+pub const SSI_TX_CHAN: usize = 54;
+pub const SSI_RX_CHAN: usize = 52;
+
+#[derive(Serialize, Deserialize)]
 pub struct Io {
     pub now: u64,
     /// The CPU stops when `now` reaches this; lowered by any event.
@@ -125,14 +166,17 @@ pub struct Io {
     pub uart9: Uart,
     pub edma: Edma,
     pub esdhc: crate::esdhc::Esdhc,
+    pub ssi: Ssi,
     /// Port D bit 4 drives port C bit 3 on the board (the SD gate).
     pub gpio_d4: bool,
     /// Registers that read as a fixed value (status bits nothing else sets).
     pub forced: HashMap<u32, u32>,
     /// Ignore IMR masking, as the reference emulator effectively did.
     pub ignore_masks: bool,
+    pub trace_intc: bool,
     /// PIT channels whose interrupts are held off (the intro policy).
     pub pit_hold: u8,
+    #[serde(with = "BigArray")]
     pub irq_taken: [u64; 256],
     /// Bytes per UART character time, in instructions.
     pub uart_byte_instr: u64,
@@ -176,9 +220,22 @@ impl Io {
                 majors: [0; 64],
             },
             esdhc: crate::esdhc::Esdhc::new(crate::esdhc::Card::new()),
+            ssi: Ssi {
+                rate: 48_000.0,
+                next: None,
+                tx_pending: 0,
+                rx_pending: 0,
+                frames: 0,
+                out: VecDeque::new(),
+                out_cap: 48_000 * 2 * 4,
+                input: VecDeque::new(),
+                regs: [0; 16],
+                enabled: true,
+            },
             gpio_d4: false,
             forced,
             ignore_masks: false,
+            trace_intc: std::env::var_os("DTEMU_TRACE_INTC").is_some(),
             pit_hold: 0,
             irq_taken: [0; 256],
             uart_byte_instr: 2000,
@@ -235,10 +292,7 @@ impl Io {
 
         let mut best = 0u8;
         for c in &self.intc {
-            let mut p = c.pending();
-            if !self.ignore_masks {
-                p &= !c.imr;
-            }
+            let mut p = c.deliverable(self.ignore_masks);
             while p != 0 {
                 let s = p.trailing_zeros();
                 p &= p - 1;
@@ -256,10 +310,7 @@ impl Io {
     pub fn ack_irq(&mut self, ipl: u8) -> Option<(u8, u8)> {
         let mut best: Option<(u8, usize, u32)> = None;
         for (ci, c) in self.intc.iter().enumerate() {
-            let mut p = c.pending();
-            if !self.ignore_masks {
-                p &= !c.imr;
-            }
+            let mut p = c.deliverable(self.ignore_masks);
             while p != 0 {
                 let s = 63 - p.leading_zeros();
                 p &= !(1u64 << s);
@@ -302,6 +353,9 @@ impl Io {
     }
 
     fn intc_write(&mut self, c: usize, off: u32, size: u32, v: u32) -> bool {
+        if self.trace_intc && off < 0x20 {
+            eprintln!("intc{c} +{off:02x}.{size} <- {v:08x} @ {}", self.now);
+        }
         let i = &mut self.intc[c];
         match (off, size) {
             (0x08, 4) => i.imr = (i.imr & 0xFFFF_FFFF) | ((v as u64) << 32),
@@ -747,6 +801,12 @@ impl Io {
         if self.esdhc.dma_request() {
             m |= 1 << crate::esdhc::DMA_CHAN;
         }
+        if self.ssi.tx_pending > 0 {
+            m |= 1 << SSI_TX_CHAN;
+        }
+        if self.ssi.rx_pending > 0 {
+            m |= 1 << SSI_RX_CHAN;
+        }
         m
     }
 
@@ -798,6 +858,16 @@ impl Io {
                 }
                 return self.edma_read(off, size);
             }
+            0xFC0C_8000 if a & 0x3FFF < 0x40 => {
+                let off = a & 0x3F;
+                if (off == 0x08 || off == 0x0C) && size == 4 {
+                    return Some(self.ssi.input.pop_front().unwrap_or(0) as u32 & 0x00FF_FFFF);
+                }
+                if size == 4 && off & 3 == 0 {
+                    return Some(self.ssi.regs[(off / 4) as usize]);
+                }
+                return None;
+            }
             0xFC0C_C000 => {
                 let r = self.esdhc.read(a & 0x3FFF, size);
                 if r.is_some() {
@@ -838,6 +908,23 @@ impl Io {
                     true
                 } else {
                     self.edma_write(off, size, v)
+                }
+            }
+            0xFC0C_8000 if a & 0x3FFF < 0x40 => {
+                let off = a & 0x3F;
+                if (off == 0x00 || off == 0x04) && size == 4 {
+                    let smp = ((v << 8) as i32) >> 8;
+                    let ssi = &mut self.ssi;
+                    if ssi.out.len() >= ssi.out_cap {
+                        ssi.out.pop_front();
+                    }
+                    ssi.out.push_back(smp);
+                    true
+                } else if size == 4 && off & 3 == 0 {
+                    self.ssi.regs[(off / 4) as usize] = v;
+                    true
+                } else {
+                    false
                 }
             }
             0xFC0C_C000 => {
@@ -912,6 +999,35 @@ impl Io {
                 }
                 next = next.min(self.dtim[ch].next.unwrap());
             }
+        }
+        // The SSI frame clock runs while either of its channels is enabled.
+        let ssi_on = self.ssi.enabled
+            && self.edma.erq & ((1 << SSI_TX_CHAN) | (1 << SSI_RX_CHAN)) != 0;
+        if ssi_on {
+            let period = self.ips / self.ssi.rate;
+            let t = *self.ssi.next.get_or_insert(now + period);
+            if now >= t {
+                let mut n = ((now - t) / period).floor() as u64 + 1;
+                // Frames the DMA could not keep up with are dropped, as a
+                // real FIFO underrun would drop them.
+                n = n.min(64);
+                self.ssi.next = Some(t + n as f64 * period);
+                if self.ssi.next.unwrap() <= now {
+                    self.ssi.next = Some(now + period);
+                }
+                self.ssi.frames += n;
+                if self.edma.erq & (1 << SSI_TX_CHAN) != 0 {
+                    self.ssi.tx_pending += n as u32;
+                    self.edma.kick |= 1 << SSI_TX_CHAN;
+                }
+                if self.edma.erq & (1 << SSI_RX_CHAN) != 0 {
+                    self.ssi.rx_pending += n as u32;
+                    self.edma.kick |= 1 << SSI_RX_CHAN;
+                }
+            }
+            next = next.min(self.ssi.next.unwrap());
+        } else {
+            self.ssi.next = None;
         }
         for ch in 0..64 {
             let b = self.edma.busy_until[ch];

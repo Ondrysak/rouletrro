@@ -98,6 +98,8 @@ pub struct Cpu {
     pub last_fault: Option<(u8, u32)>,
     /// Count of exceptions raised by vector, for diagnostics.
     pub exc_counts: [u64; 256],
+    /// Guest PC samples, one per 1024 instructions, when enabled.
+    pub profile: Option<std::collections::HashMap<u32, u64>>,
     /// A ring of the last executed PCs, when enabled (debugging).
     pub history: Option<(Vec<u32>, usize)>,
     /// The first few faults: (vector, pc, opcode, clock).
@@ -158,6 +160,7 @@ impl Cpu {
             exc_counts: [0; 256],
             fault_log: Vec::new(),
             history: None,
+            profile: None,
         }
     }
 
@@ -501,6 +504,11 @@ impl Cpu {
             self.op_pc = pc;
             self.bus.pc = pc;
             self.bus.io.now = now + 1;
+            if now & 0x3FF == 0 {
+                if let Some(p) = &mut self.profile {
+                    *p.entry(pc).or_insert(0) += 1;
+                }
+            }
             if let Some((h, i)) = &mut self.history {
                 let n = h.len();
                 h[*i % n] = pc;

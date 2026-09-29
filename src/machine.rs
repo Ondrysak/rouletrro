@@ -19,7 +19,7 @@ pub const DEFAULT_VBR: u32 = 0x4000_0000;
 /// twenty places; 0x40|0x20 would mean "no panel" and park the OS.
 pub const BOOT_FLAGS: u32 = 0x0014_0000;
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
     pub flash_reads: u64,
     pub idle_hits: u64,

@@ -12,13 +12,14 @@
 //! Everything else the ColdFire sends is display and LED traffic, kept in
 //! `out` for the display decoder.
 
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 pub const GROUPS: u8 = 6;
 pub const CARD: [u8; 4] = [0x04, 0x02, 0x00, 0x01];
 pub const SERIAL: &[u8; 12] = b"EMULATED0000";
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct PanelMcu {
     last: [u8; 2],
     /// Keys held, per group.

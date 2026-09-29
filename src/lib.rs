@@ -9,3 +9,4 @@ pub mod symbols;
 pub mod machine;
 pub mod panel;
 pub mod esdhc;
+pub mod snapshot;

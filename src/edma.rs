@@ -216,10 +216,14 @@ impl Bus {
             for (i, b) in nb.iter_mut().enumerate() {
                 *b = self.read8(t.dlast.wrapping_add(i as u32));
             }
-            let mut n = Tcd::from_bytes(&nb);
-            n.csr |= CSR_DONE;
-            n.csr &= !CSR_ACTIVE;
+            // The channel now holds the next descriptor, CSR included -- which
+            // is how E_SG clears at the end of a chain. One loaded with START
+            // set runs on.
+            let n = Tcd::from_bytes(&nb);
             self.set_tcd(ch, &n);
+            if n.csr & CSR_START != 0 {
+                self.io.edma.kick |= 1 << ch;
+            }
         } else {
             t.daddr = modulo_add(t.daddr, t.dlast, dmod);
             t.citer = t.biter;
@@ -280,10 +284,11 @@ impl Bus {
             }
             if sw {
                 // A software start runs the whole major loop.
+                let before = self.io.edma.majors[ch];
                 let mut n = 0;
                 while self.dma_minor(ch) {
                     n += 1;
-                    if self.tcd(ch).csr & CSR_DONE != 0 || n > 0x10000 {
+                    if self.io.edma.majors[ch] != before || n > 0x10000 {
                         break;
                     }
                 }
@@ -312,6 +317,12 @@ impl Bus {
                 // with blocks left).
                 let mut n = 0;
                 while self.io.edma.erq & (1 << ch) != 0 && self.io.dma_requesting() & (1 << ch) != 0 {
+                    // An SSI request is one frame: one minor loop each.
+                    match ch {
+                        crate::io::SSI_TX_CHAN => self.io.ssi.tx_pending -= 1,
+                        crate::io::SSI_RX_CHAN => self.io.ssi.rx_pending -= 1,
+                        _ => {}
+                    }
                     if !self.dma_minor(ch) {
                         break;
                     }
