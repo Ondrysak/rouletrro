@@ -1228,7 +1228,7 @@ impl Cpu {
 
     // -- line 6: branches -------------------------------------------------
 
-    fn line6(&mut self, op: u16) {
+    pub(crate) fn line6(&mut self, op: u16) {
         let base = self.pc;
         let d8 = op & 0xFF;
         let disp = match d8 {
@@ -1718,7 +1718,7 @@ impl Cpu {
     }
 
     /// The value MOVE ACCn,Rx reads.
-    fn mac_read(&self, i: usize) -> u32 {
+    pub(crate) fn mac_read(&self, i: usize) -> u32 {
         let v = self.acc_get(i);
         if self.macsr & MACSR_FI != 0 {
             if self.macsr & MACSR_SU != 0 {

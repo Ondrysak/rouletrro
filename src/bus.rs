@@ -192,11 +192,11 @@ impl Bus {
 
     fn sparse_page(&mut self, addr: u32) -> &mut [u8; SPARSE_PAGE as usize] {
         let base = addr & !(SPARSE_PAGE - 1);
-        let pc = self.pc;
-        self.sparse.entry(base).or_insert_with(|| Box::new([0; SPARSE_PAGE as usize]))
-            as &mut _;
-        let e = self.unmapped_touch.entry(base & !0xFFF).or_insert((pc, 0));
-        e.1 += 1;
+        if !self.sparse.contains_key(&base) {
+            // First touch of a page nothing models: worth knowing about.
+            self.unmapped_touch.insert(base, (self.pc, 1));
+            self.sparse.insert(base, Box::new([0; SPARSE_PAGE as usize]));
+        }
         self.sparse.get_mut(&base).unwrap()
     }
 
@@ -420,13 +420,11 @@ impl Bus {
     fn read_slow(&mut self, a: u32, size: u32) -> u32 {
         if Self::is_io(a) {
             // A model may answer; otherwise the register reads back as memory.
-            let plain = self.plain_read(a, size);
             let pc = self.pc;
             let (io, ddr) = (&mut self.io, &mut self.ddr);
-            if let Some(v) = io.read(a, size, plain, pc, ddr) {
+            if let Some(v) = io.read(a, size, 0, pc, ddr) {
                 return v;
             }
-            return plain;
         }
         self.plain_read(a, size)
     }

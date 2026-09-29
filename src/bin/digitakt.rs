@@ -45,18 +45,26 @@ struct Opts {
     after: f64,
     screenshot: Option<PathBuf>,
     presses: Vec<(u8, f64)>,
+    turns: Vec<(u8, i8, f64)>,
+    card: Option<PathBuf>,
+    audio_null: bool,
+    wav: Option<PathBuf>,
 }
 
 fn parse() -> Opts {
     let mut o = Opts {
         syx: PathBuf::from("fw/Digitakt_OS1.53.syx"),
         snapshot: None,
-        ips: 250e6,
+        ips: 200e6,
         audio: true,
         headless: false,
         after: 5.0,
         screenshot: None,
         presses: Vec::new(),
+        turns: Vec::new(),
+        card: None,
+        audio_null: false,
+        wav: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut it = args.iter();
@@ -65,6 +73,15 @@ fn parse() -> Opts {
             "--snapshot" => o.snapshot = it.next().map(PathBuf::from),
             "--ips" => o.ips = it.next().unwrap().replace('M', "e6").parse().expect("--ips"),
             "--no-audio" => o.audio = false,
+            "--audio-null" => o.audio_null = true,
+            "--card" => o.card = it.next().map(PathBuf::from),
+            "--wav" => o.wav = it.next().map(PathBuf::from),
+            "--turn" => {
+                let v = it.next().unwrap();
+                let (ed, t) = v.split_once('@').expect("--turn ENC:DELTA@SECS");
+                let (e, d) = ed.split_once(':').unwrap();
+                o.turns.push((e.parse().unwrap(), d.parse().unwrap(), t.parse().unwrap()));
+            }
             "--headless" => o.headless = true,
             "--after" => o.after = it.next().unwrap().parse().expect("--after"),
             "--screenshot" => o.screenshot = it.next().map(PathBuf::from),
@@ -74,7 +91,11 @@ fn parse() -> Opts {
                 o.presses.push((c.parse().unwrap(), t.parse().unwrap()));
             }
             "-h" | "--help" => {
-                println!("usage: digitakt [FIRMWARE.syx] [--snapshot FILE] [--ips N] [--no-audio] [--headless --after SECS --screenshot OUT.png] [--press CODE@SECS]");
+                println!(
+                    "usage: digitakt [FIRMWARE.syx] [--snapshot FILE] [--card IMAGE] [--ips N] [--no-audio]\n\
+                     \x20                [--headless --after SECS --screenshot OUT.png] [--press CODE@SECS] [--turn ENC:DELTA@SECS]\n\
+                     \x20                [--audio-null] [--wav OUT.wav]"
+                );
                 std::process::exit(0);
             }
             _ => o.syx = PathBuf::from(a),
@@ -185,6 +206,33 @@ fn emulate(
     m
 }
 
+/// A stand-in sound card: drains the ring at 48 kHz of wall time and counts
+/// the blocks it found short. What it drains can be kept for a WAV.
+fn start_null_audio(audio: Arc<Audio>, keep: Option<Arc<Mutex<Vec<f32>>>>) {
+    audio.rate.store(48_000, Ordering::Relaxed);
+    audio.live.store(true, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let mut played = 0u64;
+        loop {
+            std::thread::sleep(Duration::from_millis(5));
+            let due = (t0.elapsed().as_secs_f64() * 48_000.0) as u64;
+            let n = (due - played) as usize;
+            played = due;
+            let mut ring = audio.ring.lock().unwrap();
+            if ring.len() < n * 2 {
+                audio.dropouts.fetch_add(1, Ordering::Relaxed);
+            }
+            let take = (n * 2).min(ring.len());
+            let got: Vec<f32> = ring.drain(..take).collect();
+            drop(ring);
+            if let Some(k) = &keep {
+                k.lock().unwrap().extend(got);
+            }
+        }
+    });
+}
+
 fn start_audio(audio: Arc<Audio>) -> Option<cpal::Stream> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let host = cpal::default_host();
@@ -259,10 +307,25 @@ fn main() {
         rate: AtomicU64::new(48_000),
         live: AtomicBool::new(false),
     });
-    let _stream = if o.audio && !o.headless { start_audio(audio.clone()) } else { None };
-    if o.audio && !o.headless && _stream.is_none() {
-        eprintln!("audio: no output device; running without sound");
+    if let Some(c) = &o.card {
+        match m.attach_card(c) {
+            Ok(()) => eprintln!("card {}", c.display()),
+            Err(e) => eprintln!("{}: {e}; using a blank card", c.display()),
+        }
     }
+    let kept: Option<Arc<Mutex<Vec<f32>>>> = o.wav.as_ref().map(|_| Arc::new(Mutex::new(Vec::new())));
+    let _stream = if o.audio_null {
+        start_null_audio(audio.clone(), kept.clone());
+        None
+    } else if o.audio && !o.headless {
+        let s = start_audio(audio.clone());
+        if s.is_none() {
+            eprintln!("audio: no output device; running without sound");
+        }
+        s
+    } else {
+        None
+    };
     let quit = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let opts = Arc::new(o);
@@ -277,8 +340,22 @@ fn main() {
         let mut presses = opts.presses.clone();
         presses.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         let mut pending: Vec<(u8, f64)> = Vec::new();
+        let mut turns = opts.turns.clone();
+        let mut last_report = 0.0;
         while t0.elapsed().as_secs_f64() < opts.after {
             let t = t0.elapsed().as_secs_f64();
+            turns.retain(|&(e, d, at)| {
+                if at <= t {
+                    let _ = tx.send(Ev::Turn(e, d));
+                    false
+                } else {
+                    true
+                }
+            });
+            if t - last_report >= 1.0 {
+                last_report = t;
+                eprintln!("{:5.1} s  {}", t, view.lock().unwrap().status);
+            }
             while let Some(&(c, at)) = presses.first() {
                 if at > t {
                     break;
@@ -304,6 +381,12 @@ fn main() {
         if let Some(p) = &opts.screenshot {
             gui::save_png(&cv, p).unwrap();
             eprintln!("wrote {}", p.display());
+        }
+        if let (Some(p), Some(k)) = (&opts.wav, &kept) {
+            let s = k.lock().unwrap();
+            write_wav(p, &s);
+            let peak = s.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            eprintln!("wrote {} ({:.2} s, peak {:.4})", p.display(), s.len() as f64 / 96_000.0, peak);
         }
         return;
     }
@@ -418,4 +501,23 @@ fn run_window(o: &Opts, tx: mpsc::Sender<Ev>, view: Arc<Mutex<View>>, _quit: Arc
             break;
         }
     }
+}
+
+fn write_wav(path: &std::path::Path, s: &[f32]) {
+    let data: Vec<u8> = s.iter().flat_map(|&x| ((x.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes()).collect();
+    let mut f = Vec::new();
+    f.extend_from_slice(b"RIFF");
+    f.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    f.extend_from_slice(b"WAVEfmt ");
+    f.extend_from_slice(&16u32.to_le_bytes());
+    f.extend_from_slice(&1u16.to_le_bytes());
+    f.extend_from_slice(&2u16.to_le_bytes());
+    f.extend_from_slice(&48_000u32.to_le_bytes());
+    f.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+    f.extend_from_slice(&4u16.to_le_bytes());
+    f.extend_from_slice(&16u16.to_le_bytes());
+    f.extend_from_slice(b"data");
+    f.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    f.extend_from_slice(&data);
+    let _ = std::fs::write(path, f);
 }

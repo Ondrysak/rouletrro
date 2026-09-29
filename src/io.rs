@@ -199,7 +199,7 @@ impl Io {
         Io {
             now: 0,
             deadline: u64::MAX,
-            ips: 100_000_000.0,
+            ips: 200_000_000.0,
             irq_level: 0,
             intc: [Intc::new(), Intc::new(), Intc::new()],
             pit: Default::default(),
@@ -881,7 +881,7 @@ impl Io {
             0xEC09_4000 => {
                 // PPDSDR_C: bit 3 follows the port D bit 4 the board loops back.
                 if a == 0xEC09_401A && size == 1 {
-                    return Some(if self.gpio_d4 { 0x08 } else { 0 } | (_plain & !0x08));
+                    return Some(if self.gpio_d4 { 0x08 } else { 0 });
                 }
             }
             _ => {}

@@ -56,6 +56,149 @@ fn h_word(c: &mut Cpu, o: &Op) {
     c.dispatch(o.op);
 }
 
+/// `h_word` with the line already chosen.
+fn h_word_line(op: u16) -> Handler {
+    fn l0(c: &mut Cpu, o: &Op) { c.line0(o.op) }
+    fn l1(c: &mut Cpu, o: &Op) { c.op_move(o.op, 1) }
+    fn l2(c: &mut Cpu, o: &Op) { c.op_move(o.op, 4) }
+    fn l3(c: &mut Cpu, o: &Op) { c.op_move(o.op, 2) }
+    fn l4(c: &mut Cpu, o: &Op) { c.line4(o.op) }
+    fn l5(c: &mut Cpu, o: &Op) { c.line5(o.op) }
+    fn l7(c: &mut Cpu, o: &Op) { c.line7(o.op) }
+    fn l8(c: &mut Cpu, o: &Op) { c.line8(o.op) }
+    fn l9(c: &mut Cpu, o: &Op) { c.line9d(o.op, false) }
+    fn la(c: &mut Cpu, o: &Op) { c.linea(o.op) }
+    fn lb(c: &mut Cpu, o: &Op) { c.lineb(o.op) }
+    fn lc(c: &mut Cpu, o: &Op) { c.linec(o.op) }
+    fn ld(c: &mut Cpu, o: &Op) { c.line9d(o.op, true) }
+    fn le(c: &mut Cpu, o: &Op) { c.linee(o.op) }
+    match op >> 12 {
+        0x0 => l0,
+        0x1 => l1,
+        0x2 => l2,
+        0x3 => l3,
+        0x4 => l4,
+        0x5 => l5,
+        0x7 => l7,
+        0x8 => l8,
+        0x9 => l9,
+        0xA => la,
+        0xB => lb,
+        0xC => lc,
+        0xD => ld,
+        0xE => le,
+        _ => h_word,
+    }
+}
+
+/// Register shifts. KIND: 0 left (ASL/LSL: ColdFire's ASL clears V like
+/// LSL), 1 LSR, 2 ASR. `r` is the data register, `x` the count, or with
+/// REG the count register.
+fn h_shift<const KIND: u8, const REG: bool>(c: &mut Cpu, o: &Op) {
+    let count = if REG { c.d[o.x as usize] & 63 } else { o.x };
+    let v = c.d[o.r as usize];
+    let mut ccr = c.sr & !0x1F;
+    let res;
+    if count == 0 {
+        res = v;
+        ccr |= c.sr & CF_X;
+    } else {
+        let carry;
+        match KIND {
+            0 => {
+                res = if count >= 32 { 0 } else { v << count };
+                carry = count <= 32 && (v >> (32 - count)) & 1 != 0;
+            }
+            1 => {
+                res = if count >= 32 { 0 } else { v >> count };
+                carry = count <= 32 && (v >> (count - 1)) & 1 != 0;
+            }
+            _ => {
+                let sv = v as i32;
+                res = if count >= 32 { (sv >> 31) as u32 } else { (sv >> count) as u32 };
+                carry = if count >= 32 { sv < 0 } else { (v >> (count - 1)) & 1 != 0 };
+            }
+        }
+        if carry {
+            ccr |= CF_C | CF_X;
+        }
+    }
+    if res == 0 {
+        ccr |= CF_Z;
+    }
+    if res & 0x8000_0000 != 0 {
+        ccr |= CF_N;
+    }
+    c.sr = ccr;
+    c.d[o.r as usize] = res;
+}
+
+/// ADDX.L / SUBX.L Dy,Dx: `r` = Dx, `x` = Dy.
+fn h_addx<const SUB: bool>(c: &mut Cpu, o: &Op) {
+    let x = c.sr & CF_X != 0;
+    let z = c.sr & CF_Z;
+    let (s, d) = (c.d[o.x as usize], c.d[o.r as usize]);
+    let r = if SUB { c.sub_flags(s, d, 4, x) } else { c.add_flags(s, d, 4, x) };
+    if r == 0 {
+        c.sr = (c.sr & !CF_Z) | z;
+    }
+    c.d[o.r as usize] = r;
+}
+
+/// MOVE.L ACCy,Rx / MOVCLR.L: `r` = Rx as 0-15, `x` = y | clear << 8.
+fn h_movacc(c: &mut Cpu, o: &Op) {
+    use crate::cpu::MACSR_PAV0;
+    let i = (o.x & 3) as usize;
+    let v = c.mac_read(i);
+    let r = o.r as usize;
+    if r >= 8 {
+        c.a[r - 8] = v;
+    } else {
+        c.d[r] = v;
+    }
+    if o.x & 0x100 != 0 {
+        c.accv[i] = 0;
+        c.macsr &= !(MACSR_PAV0 << i);
+    }
+}
+
+/// A single-word instruction with a native handler, if it has one.
+fn word_native(op: u16) -> Option<Op> {
+    let r = (op & 7) as u8;
+    match op >> 12 {
+        0xE if (op >> 6) & 3 == 2 && (op >> 3) & 3 <= 1 => {
+            let left = op & 0x100 != 0;
+            let kind = if left { 0 } else if (op >> 3) & 1 != 0 { 1 } else { 2 };
+            let reg = op & 0x20 != 0;
+            let f = ((op >> 9) & 7) as u32;
+            let mut o = mk(match (kind, reg) {
+                (0, false) => h_shift::<0, false>,
+                (0, true) => h_shift::<0, true>,
+                (1, false) => h_shift::<1, false>,
+                (1, true) => h_shift::<1, true>,
+                (_, false) => h_shift::<2, false>,
+                _ => h_shift::<2, true>,
+            });
+            o.r = r;
+            o.x = if reg { f } else if f == 0 { 8 } else { f };
+            Some(o)
+        }
+        0x9 | 0xD if op & 0x01F8 == 0x0180 => {
+            let mut o = mk(if op >> 12 == 0x9 { h_addx::<true> } else { h_addx::<false> });
+            o.r = ((op >> 9) & 7) as u8;
+            o.x = r as u32;
+            Some(o)
+        }
+        0xA if op & 0xF9B0 == 0xA180 => {
+            let mut o = mk(h_movacc);
+            o.r = (op & 0xF) as u8;
+            o.x = ((op >> 9) & 3) as u32 | if op & 0x40 != 0 { 0x100 } else { 0 };
+            Some(o)
+        }
+        _ => None,
+    }
+}
+
 // -- operand access -----------------------------------------------------------
 
 #[inline(always)]
@@ -562,7 +705,7 @@ pub fn decode(c: &Cpu, pc: u32) -> Op {
             o
         }
         None if single_word(op) => {
-            let mut o = mk(h_word);
+            let mut o = word_native(op).unwrap_or_else(|| mk(h_word_line(op)));
             o.op = op;
             o.len = 2;
             // Returns, traps and SR writes change the flow or the mask.

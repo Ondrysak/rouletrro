@@ -119,6 +119,7 @@ fn main() {
         instr += m.now();
     }
     let t0 = Instant::now();
+    let (clock0, idle0) = (m.now(), m.stats.idle_skipped);
     let mut logged = 0;
     let mut target = m.now();
     while target < instr {
@@ -231,14 +232,15 @@ fn main() {
         println!("saved {p} ({} bytes)", std::fs::metadata(p).unwrap().len());
     }
     let secs = t0.elapsed().as_secs_f64();
-    let executed = m.now().saturating_sub(m.stats.idle_skipped);
+    let executed = (m.now() - clock0) - (m.stats.idle_skipped - idle0);
     println!(
-        "{} instructions ({} executed, {} idle-skipped) in {:.2}s = {:.1} MIPS executed",
-        m.now(),
+        "{} instructions ({} executed, {} idle-skipped) in {:.2}s = {:.1} MIPS executed, {:.0}% of real time",
+        m.now() - clock0,
         executed,
-        m.stats.idle_skipped,
+        m.stats.idle_skipped - idle0,
         secs,
-        executed as f64 / secs / 1e6
+        executed as f64 / secs / 1e6,
+        (m.now() - clock0) as f64 / m.cpu.bus.io.ips / secs * 100.0
     );
     let exc: Vec<String> = m.cpu.exc_counts.iter().enumerate().filter(|x| *x.1 > 0 && x.0 < 64).map(|(v, n)| format!("{v}:{n}")).collect();
     println!("cpu exceptions: {}", exc.join(" "));
