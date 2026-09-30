@@ -29,7 +29,8 @@ counts (suffixes k, M, G).
   --ips N              instructions per emulated second (default 200M)
   --load SNAP          resume a snapshot
   --save SNAP          save a snapshot at the end
-  --card IMAGE         back the eMMC with an image file
+  --card IMAGE         back the eMMC with an image file (read only: changes
+                       are not written back; a missing image starts formatted)
   --press CODE@AT[:HOLD]
                        press key CODE at clock AT for HOLD (default 30M)
   --turn ENC:DELTA@ATxCOUNT[/SPACING]
@@ -145,8 +146,8 @@ fn main() {
         m.cpu.bus.watch = Some((o, o + 4));
     }
     if let Some(p) = &card {
-        m.attach_card(std::path::Path::new(p)).unwrap();
-        println!("card {p}: {} sectors in use", m.cpu.bus.io.esdhc.card.sectors.len());
+        let fresh = m.attach_card(std::path::Path::new(p)).unwrap();
+        println!("card {p}: {} sectors in use{}", m.cpu.bus.io.esdhc.card.sectors.len(), if fresh { " (new, sample area formatted)" } else { "" });
     }
     if let Some(p) = &load {
         dtemu::snapshot::load(&mut m, std::path::Path::new(p)).unwrap();

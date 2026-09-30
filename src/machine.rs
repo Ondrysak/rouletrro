@@ -270,9 +270,17 @@ impl Machine {
     }
 
     /// Attach a +Drive card image (read now; `flush_card` writes it back).
-    pub fn attach_card(&mut self, path: &std::path::Path) -> std::io::Result<()> {
-        self.cpu.bus.io.esdhc.card = crate::esdhc::Card::open(path)?;
-        Ok(())
+    /// A missing or empty image becomes a fresh card with the sample area
+    /// formatted, as a factory unit's is (the OS never creates it itself).
+    /// -> whether the card is fresh.
+    pub fn attach_card(&mut self, path: &std::path::Path) -> std::io::Result<bool> {
+        let mut card = crate::esdhc::Card::open(path)?;
+        let fresh = card.sectors.is_empty();
+        if fresh {
+            crate::ekfs::format(&mut card);
+        }
+        self.cpu.bus.io.esdhc.card = card;
+        Ok(fresh)
     }
 
     pub fn flush_card(&mut self) -> std::io::Result<()> {

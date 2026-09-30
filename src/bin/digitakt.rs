@@ -334,9 +334,15 @@ fn main() {
     });
     // The card first: a snapshot then brings its own sectors (the firmware's
     // cached view of the drive matches those) and keeps the image path.
+    let mut image = None;
     if let Some(c) = &o.card {
         match m.attach_card(c) {
-            Ok(()) => eprintln!("card {}", c.display()),
+            Ok(fresh) => {
+                eprintln!("card {}{}", c.display(), if fresh { ": new, sample area formatted" } else { "" });
+                if !fresh {
+                    image = Some(m.cpu.bus.io.esdhc.card.sectors.clone());
+                }
+            }
             Err(e) => eprintln!("{}: {e}; using a blank card", c.display()),
         }
     }
@@ -347,6 +353,17 @@ fn main() {
                     eprintln!("resumed {}", p.display());
                     let card = &mut m.cpu.bus.io.esdhc.card;
                     card.dirty = card.path.is_some();
+                    if image.is_some_and(|i| i != card.sectors) {
+                        // Changed since the snapshot (dtcard, another
+                        // session): the snapshot's copy runs and will be
+                        // written back, so keep the image's version.
+                        BACKUP_CARD.store(true, Ordering::Relaxed);
+                        eprintln!(
+                            "warning: {} differs from the snapshot's copy of the card; running the snapshot's. \
+                             The image is kept as IMAGE.bak when the card is saved; start without --snapshot to use the image.",
+                            o.card.as_ref().unwrap().display()
+                        );
+                    }
                 }
                 Err(e) => eprintln!("{}: {e}; booting from reset", p.display()),
             }
@@ -553,9 +570,25 @@ fn run_window(o: &Opts, tx: mpsc::Sender<Ev>, view: Arc<Mutex<View>>, _quit: Arc
 }
 
 /// Write the card back to its image, if it has one and it changed.
+/// Set when the image on disk is not the card the snapshot resumed with.
+static BACKUP_CARD: AtomicBool = AtomicBool::new(false);
+
 fn save_card(m: &mut Machine, o: &Opts) {
     if let Some(c) = &o.card {
         let dirty = m.cpu.bus.io.esdhc.card.dirty;
+        if dirty && BACKUP_CARD.swap(false, Ordering::Relaxed) && c.exists() {
+            let mut bak = c.clone().into_os_string();
+            bak.push(".bak");
+            let bak = PathBuf::from(bak);
+            match std::fs::rename(c, &bak) {
+                Ok(()) => eprintln!("kept the previous image as {}", bak.display()),
+                Err(e) => {
+                    BACKUP_CARD.store(true, Ordering::Relaxed);
+                    eprintln!("{}: {e}; not overwriting {}", bak.display(), c.display());
+                    return;
+                }
+            }
+        }
         match m.flush_card() {
             Ok(()) if dirty => eprintln!("wrote card {}", c.display()),
             Ok(()) => {}
