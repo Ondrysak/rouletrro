@@ -327,6 +327,11 @@ def run_unicorn(code, d, a, sr, data):
     return ('OK', regs, pc, s)
 
 
+# Differences where the emulator follows the ColdFire manual and Unicorn
+# does not: MVZ always clears N; Unicorn sets it from the result.
+KNOWN = {'mvsz'}
+
+
 def main():
     n = 3000
     seed = 1
@@ -375,7 +380,11 @@ def main():
     total = len(cases) - skipped
     print('%d cases, %d skipped (unicorn fault/exception), %d mismatches' % (total, skipped, sum(bad.values())))
     for k, v in bad.most_common():
-        print('  %-14s %d' % (k, v))
+        print('  %-14s %d%s' % (k, v, '  (known)' if k in KNOWN else ''))
+    unexpected = sum(v for k, v in bad.items() if k not in KNOWN)
+    if unexpected:
+        print('%d unexpected mismatches' % unexpected)
+        sys.exit(1)
 
 
 if __name__ == '__main__':

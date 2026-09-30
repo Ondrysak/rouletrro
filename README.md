@@ -169,8 +169,10 @@ python3 tools/cfdis.py 40075e00 +100   # disassemble MAIN OS
 ```
 
 `cfdiff` runs random instruction sequences on both cores and compares
-registers and memory. The known differences are MVS/MVZ flags, where
-the emulator follows the ColdFire manual and Unicorn does not.
+registers and memory; it fails on any difference but the known one (MVZ,
+which clears N per the ColdFire manual where Unicorn sets it). CI runs the
+build, the tests, clippy and `cfdiff` on every push; none of it needs the
+firmware.
 
 ## Status
 

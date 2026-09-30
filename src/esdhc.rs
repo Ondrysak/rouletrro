@@ -208,6 +208,8 @@ pub struct Esdhc {
 }
 
 impl Esdhc {
+    // Registers are indexed as byte offset / 4, as the manual lists them.
+    #[allow(clippy::eq_op)]
     pub fn new(card: Card) -> Esdhc {
         let mut regs = [0u32; 0x40];
         regs[0x04 / 4] = 0x0001_0000; // BLKATTR

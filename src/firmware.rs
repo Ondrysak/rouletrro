@@ -1,11 +1,14 @@
 //! Elektron OS `.syx` → ELE3 container → decompressed sections.
 //!
 //! Layer cake, outermost first:
-//!   1. MIDI SysEx  -- `F0 00 20 3C <dev> 00 <cmd> ... F7` messages
+//!
+//! ```text
+//!   1. MIDI SysEx  -- F0 00 20 3C <dev> 00 <cmd> ... F7 messages
 //!   2. 8-in-7      -- each group of 7 data bytes is preceded by a byte
 //!                     holding their high bits, MSB first
 //!   3. preamble    -- 8 bytes; bytes 4..8 are a 32-bit content checksum
 //!   4. ELE3        -- magic, then a section table of 16-byte entries
+//! ```
 //!
 //! A section's payload is packed when its 8-byte header
 //! `[u32 len][u32 byte sum]` is self-consistent; otherwise it is stored raw

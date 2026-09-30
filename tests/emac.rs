@@ -143,7 +143,9 @@ fn integer_and_scale_cases() {
     let mac_l_sl1 = [0xa907, 0xa1c1, 0xa805, 0x0a00, 0xa1c1];
     let msac_l = [0xa907, 0xa1c1, 0xa805, 0x0900, 0xa1c1];
     let msac_l_sr1 = [0xa907, 0xa1c1, 0xa805, 0x0f00, 0xa1c1];
-    let cases: &[(&str, &[u16; 5], u32, u32, u32, u32)] = &[
+    // (name, program, MACSR (via D7), D5, D4, expected D1)
+    type Case<'a> = (&'a str, &'a [u16; 5], u32, u32, u32, u32);
+    let cases: &[Case] = &[
         ("signed word -3*5", &mac_w_low, 0x00, 0xFFFD, 5, 0xFFFFFFF1),
         ("signed OMC -1000*1", &mac_l, 0x80, 0xFFFFFC18, 1, 0xFFFFFC18),
         ("signed OMC sat +", &mac_l, 0x80, 0x7FFFFFFF, 2, 0x7FFFFFFF),
@@ -230,14 +232,12 @@ fn fast_mac_matches_interpreter() {
         }
         let accs: Vec<i64> = (0..4).map(|_| ((rnd() as i64) << 16) >> 16).collect();
         let setup = |c: &mut Cpu| {
-            for i in 0..8 {
-                c.d[i] = regs[i];
-                c.a[i] = regs[8 + i];
-            }
+            c.d.copy_from_slice(&regs[..8]);
+            c.a.copy_from_slice(&regs[8..]);
             c.macsr = macsr;
             c.mask = 0xFFFF_0000 | (rnd_mask(case) as u32);
-            for i in 0..4 {
-                c.acc_set(i, accs[i]);
+            for (i, &v) in accs.iter().enumerate() {
+                c.acc_set(i, v);
             }
         };
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();

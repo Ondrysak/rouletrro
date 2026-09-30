@@ -269,7 +269,7 @@ fn start_audio(audio: Arc<Audio>) -> Option<cpal::Stream> {
     let cfg = supported
         .iter()
         .find(|c| c.channels() == 2 && c.min_sample_rate().0 <= 48_000 && c.max_sample_rate().0 >= 48_000 && c.sample_format() == cpal::SampleFormat::F32)
-        .map(|c| c.clone().with_sample_rate(cpal::SampleRate(48_000)))
+        .map(|c| c.with_sample_rate(cpal::SampleRate(48_000)))
         .or_else(|| dev.default_output_config().ok())?;
     if cfg.sample_format() != cpal::SampleFormat::F32 {
         eprintln!("audio: the device's format is {:?}, not f32; running without sound", cfg.sample_format());

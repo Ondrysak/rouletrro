@@ -1361,7 +1361,7 @@ impl Cpu {
             let (a, b) = (dv as i32 as i64, s16 as u16 as i16 as i64);
             let q = a / b;
             let r = a % b;
-            (q as u32, r as u32, q < -32768 || q > 32767)
+            (q as u32, r as u32, !(-32768..=32767).contains(&q))
         } else {
             let q = dv / s16;
             (q, dv % s16, q > 0xFFFF)
@@ -1554,7 +1554,7 @@ impl Cpu {
             0xF400 => {
                 // CPUSHL / INTOUCH: no cache is modelled.
                 if !self.supervisor() {
-                    return self.illegal(VEC_PRIV);
+                    self.illegal(VEC_PRIV);
                 }
             }
             0xFB00 => {

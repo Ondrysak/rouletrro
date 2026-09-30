@@ -337,8 +337,7 @@ impl Machine {
         let mut s = String::new();
         // Two pixel rows per text line.
         for y in (0..64).step_by(2) {
-            for x in 0..128 {
-                let (a, b) = (rows[y][x], rows[y + 1][x]);
+            for (&a, &b) in rows[y].iter().zip(&rows[y + 1]) {
                 s.push(match (a, b) {
                     (true, true) => '█',
                     (true, false) => '▀',
