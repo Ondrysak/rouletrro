@@ -31,6 +31,7 @@ enum Ev {
 
 struct Audio {
     ring: Mutex<VecDeque<f32>>,
+    /// Underruns heard: the ring ran dry while the output was not silent.
     dropouts: AtomicU64,
     rate: AtomicU64,
     live: AtomicBool,
@@ -225,6 +226,7 @@ fn start_null_audio(audio: Arc<Audio>, keep: Option<Arc<Mutex<Vec<f32>>>>) {
     std::thread::spawn(move || {
         let t0 = Instant::now();
         let mut played = 0u64;
+        let mut last = 0.0f32;
         loop {
             std::thread::sleep(Duration::from_millis(5));
             let due = (t0.elapsed().as_secs_f64() * 48_000.0) as u64;
@@ -237,17 +239,25 @@ fn start_null_audio(audio: Arc<Audio>, keep: Option<Arc<Mutex<Vec<f32>>>>) {
                 continue;
             }
             let mut ring = audio.ring.lock().unwrap();
-            if ring.len() < n * 2 {
-                audio.dropouts.fetch_add(1, Ordering::Relaxed);
-            }
             let take = (n * 2).min(ring.len());
             let got: Vec<f32> = ring.drain(..take).collect();
             drop(ring);
+            if let Some(&x) = got.last() {
+                last = x;
+            }
+            if take < n * 2 && audible(last) {
+                audio.dropouts.fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(k) = &keep {
                 k.lock().unwrap().extend(got);
             }
         }
     });
+}
+
+/// Whether a gap after this sample would be heard (-80 dBFS and up).
+fn audible(x: f32) -> bool {
+    x.abs() > 1e-4
 }
 
 fn start_audio(audio: Arc<Audio>) -> Option<cpal::Stream> {
@@ -259,7 +269,7 @@ fn start_audio(audio: Arc<Audio>) -> Option<cpal::Stream> {
     let cfg = supported
         .iter()
         .find(|c| c.channels() == 2 && c.min_sample_rate().0 <= 48_000 && c.max_sample_rate().0 >= 48_000 && c.sample_format() == cpal::SampleFormat::F32)
-        .map(|c| c.clone().with_sample_rate(cpal::SampleRate(48_000)))
+        .map(|c| c.with_sample_rate(cpal::SampleRate(48_000)))
         .or_else(|| dev.default_output_config().ok())?;
     if cfg.sample_format() != cpal::SampleFormat::F32 {
         eprintln!("audio: the device's format is {:?}, not f32; running without sound", cfg.sample_format());
@@ -268,6 +278,7 @@ fn start_audio(audio: Arc<Audio>) -> Option<cpal::Stream> {
     let channels = cfg.channels() as usize;
     audio.rate.store(cfg.sample_rate().0 as u64, Ordering::Relaxed);
     let a = audio.clone();
+    let mut last = 0.0f32;
     let stream = dev
         .build_output_stream(
             &cfg.config(),
@@ -279,7 +290,15 @@ fn start_audio(audio: Arc<Audio>) -> Option<cpal::Stream> {
                 let mut ring = a.ring.lock().unwrap();
                 let frames = data.len() / channels;
                 if ring.len() < frames * 2 {
-                    a.dropouts.fetch_add(1, Ordering::Relaxed);
+                    // What was already queued plays out first.
+                    if let Some(&x) = ring.back() {
+                        last = x;
+                    }
+                    if audible(last) {
+                        a.dropouts.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if let Some(&x) = ring.get(frames * 2 - 1) {
+                    last = x;
                 }
                 for f in data.chunks_mut(channels) {
                     let l = ring.pop_front().unwrap_or(0.0);
@@ -315,9 +334,15 @@ fn main() {
     });
     // The card first: a snapshot then brings its own sectors (the firmware's
     // cached view of the drive matches those) and keeps the image path.
+    let mut image = None;
     if let Some(c) = &o.card {
         match m.attach_card(c) {
-            Ok(()) => eprintln!("card {}", c.display()),
+            Ok(fresh) => {
+                eprintln!("card {}{}", c.display(), if fresh { ": new, sample area formatted" } else { "" });
+                if !fresh {
+                    image = Some(m.cpu.bus.io.esdhc.card.sectors.clone());
+                }
+            }
             Err(e) => eprintln!("{}: {e}; using a blank card", c.display()),
         }
     }
@@ -328,6 +353,17 @@ fn main() {
                     eprintln!("resumed {}", p.display());
                     let card = &mut m.cpu.bus.io.esdhc.card;
                     card.dirty = card.path.is_some();
+                    if image.is_some_and(|i| i != card.sectors) {
+                        // Changed since the snapshot (dtcard, another
+                        // session): the snapshot's copy runs and will be
+                        // written back, so keep the image's version.
+                        BACKUP_CARD.store(true, Ordering::Relaxed);
+                        eprintln!(
+                            "warning: {} differs from the snapshot's copy of the card; running the snapshot's. \
+                             The image is kept as IMAGE.bak when the card is saved; start without --snapshot to use the image.",
+                            o.card.as_ref().unwrap().display()
+                        );
+                    }
                 }
                 Err(e) => eprintln!("{}: {e}; booting from reset", p.display()),
             }
@@ -534,9 +570,25 @@ fn run_window(o: &Opts, tx: mpsc::Sender<Ev>, view: Arc<Mutex<View>>, _quit: Arc
 }
 
 /// Write the card back to its image, if it has one and it changed.
+/// Set when the image on disk is not the card the snapshot resumed with.
+static BACKUP_CARD: AtomicBool = AtomicBool::new(false);
+
 fn save_card(m: &mut Machine, o: &Opts) {
     if let Some(c) = &o.card {
         let dirty = m.cpu.bus.io.esdhc.card.dirty;
+        if dirty && BACKUP_CARD.swap(false, Ordering::Relaxed) && c.exists() {
+            let mut bak = c.clone().into_os_string();
+            bak.push(".bak");
+            let bak = PathBuf::from(bak);
+            match std::fs::rename(c, &bak) {
+                Ok(()) => eprintln!("kept the previous image as {}", bak.display()),
+                Err(e) => {
+                    BACKUP_CARD.store(true, Ordering::Relaxed);
+                    eprintln!("{}: {e}; not overwriting {}", bak.display(), c.display());
+                    return;
+                }
+            }
+        }
         match m.flush_card() {
             Ok(()) if dirty => eprintln!("wrote card {}", c.display()),
             Ok(()) => {}

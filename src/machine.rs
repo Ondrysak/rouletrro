@@ -270,9 +270,17 @@ impl Machine {
     }
 
     /// Attach a +Drive card image (read now; `flush_card` writes it back).
-    pub fn attach_card(&mut self, path: &std::path::Path) -> std::io::Result<()> {
-        self.cpu.bus.io.esdhc.card = crate::esdhc::Card::open(path)?;
-        Ok(())
+    /// A missing or empty image becomes a fresh card with the sample area
+    /// formatted, as a factory unit's is (the OS never creates it itself).
+    /// -> whether the card is fresh.
+    pub fn attach_card(&mut self, path: &std::path::Path) -> std::io::Result<bool> {
+        let mut card = crate::esdhc::Card::open(path)?;
+        let fresh = card.sectors.is_empty();
+        if fresh {
+            crate::ekfs::format(&mut card);
+        }
+        self.cpu.bus.io.esdhc.card = card;
+        Ok(fresh)
     }
 
     pub fn flush_card(&mut self) -> std::io::Result<()> {
@@ -329,8 +337,7 @@ impl Machine {
         let mut s = String::new();
         // Two pixel rows per text line.
         for y in (0..64).step_by(2) {
-            for x in 0..128 {
-                let (a, b) = (rows[y][x], rows[y + 1][x]);
+            for (&a, &b) in rows[y].iter().zip(&rows[y + 1]) {
                 s.push(match (a, b) {
                     (true, true) => '█',
                     (true, false) => '▀',

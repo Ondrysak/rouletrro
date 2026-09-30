@@ -31,14 +31,14 @@ its path as the first argument to any of the tools.
 ## Play
 
 ```sh
-# A blank card image is created on first use.
+# A missing image is created, with the sample area formatted.
 ./target/release/digitakt --card digitakt.img --snapshot digitakt.snap
 ```
 
-The first start boots from reset: splash screens, then, on a blank card,
+The first start boots from reset: splash screens, then, on a new card,
 the OS copies its factory project to the +Drive (about half a minute of
-emulated time, partly slower than real time, so expect audio dropouts
-until it is done). On exit (or with
+emulated time; the CPU is fully busy, so a slow host runs it below real
+time). On exit (or with
 F5) the machine is saved to `--snapshot` and the card to `--card`; the next
 start resumes from the snapshot instantly.
 
@@ -68,22 +68,25 @@ The status line shows the buffered audio, dropouts, and emulation speed
 ### Samples
 
 `dtcard` writes WAV files to the card's `/incoming` directory, where the
-OS's sample browser (SETTINGS > SAMPLES) finds them. The samples live in
-their own area of the card, which the OS does not create on its own (on
-the hardware that is FORMAT +DRIVE); `format` creates it, and touches
-nothing else:
+OS's sample browser (SETTINGS > SAMPLES) finds them:
 
 ```sh
-./target/release/dtcard digitakt.img format      # once per image; erases its samples
 ./target/release/dtcard digitakt.img add kick.wav snare.wav
 ./target/release/dtcard digitakt.img list
+./target/release/dtcard digitakt.img format      # erases the samples (only)
 ```
 
-Do this while the emulator is not running. A snapshot carries its own
-copy of the card (the OS's view of the drive must match it), and that copy
-wins over the image and is written back to it on exit. So after adding
-files, start once without `--snapshot` (or delete the snapshot): the OS
-cold-boots and mounts the image as it is. WAV files (8-32 bit integer or
+The samples live in their own area of the card, formatted when the
+emulator creates the image (on the hardware the factory does it, or FORMAT
++DRIVE); `format` recreates it and touches nothing else. An image from an
+older version of the emulator may lack it: run `format` once.
+
+Do this while the emulator is not running, then start once without
+`--snapshot` so the OS cold-boots and mounts the image as it is. A
+snapshot carries its own copy of the card (the OS's view of the drive must
+match it), and resuming one runs that copy. If the image differs from it,
+the emulator warns, and before writing the card back it keeps the image as
+`IMAGE.bak`. WAV files (8-32 bit integer or
 32-bit float, any channel count) are mixed to 16-bit mono; the sample rate
 is kept in the sample's header.
 
@@ -166,8 +169,10 @@ python3 tools/cfdis.py 40075e00 +100   # disassemble MAIN OS
 ```
 
 `cfdiff` runs random instruction sequences on both cores and compares
-registers and memory. The known differences are MVS/MVZ flags, where
-the emulator follows the ColdFire manual and Unicorn does not.
+registers and memory; it fails on any difference but the known one (MVZ,
+which clears N per the ColdFire manual where Unicorn sets it). CI runs the
+build, the tests, clippy and `cfdiff` on every push; none of it needs the
+firmware.
 
 ## Status
 

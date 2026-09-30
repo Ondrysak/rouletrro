@@ -290,11 +290,164 @@ fn read(c: &mut Cpu, e: Ea, sz: u32) -> u32 {
 
 // -- handlers -------------------------------------------------------------------
 
-fn h_move<const SZ: u32>(c: &mut Cpu, o: &Op) {
-    let v = read(c, o.a, SZ);
-    let l = loc(c, o.b, SZ);
-    c.write_loc(l, SZ, v);
+/// Operand kinds `h_mv` is specialized on; anything else takes the
+/// generic path.
+const K_D: u8 = 0;
+const K_A: u8 = 1;
+const K_IND: u8 = 2;
+const K_POST: u8 = 3;
+const K_PRE: u8 = 4;
+const K_DISP: u8 = 5;
+const K_IMM: u8 = 6;
+const K_ANY: u8 = 7;
+
+fn kind(e: Ea) -> u8 {
+    match e {
+        Ea::D(_) => K_D,
+        Ea::A(_) => K_A,
+        Ea::Ind(_) => K_IND,
+        Ea::Post(_) => K_POST,
+        Ea::Pre(_) => K_PRE,
+        Ea::Disp(..) => K_DISP,
+        Ea::Imm(_) => K_IMM,
+        _ => K_ANY,
+    }
+}
+
+/// A source operand of kind K.
+#[inline(always)]
+fn get<const K: u8, const SZ: u32>(c: &mut Cpu, e: Ea) -> u32 {
+    match (K, e) {
+        (K_D, Ea::D(r)) => c.d[(r & 7) as usize] & mask(SZ),
+        (K_A, Ea::A(r)) => c.a[(r & 7) as usize] & mask(SZ),
+        (K_IMM, Ea::Imm(v)) => v,
+        (K_IND, Ea::Ind(r)) => {
+            let a = c.a[(r & 7) as usize];
+            c.rd(a, SZ)
+        }
+        (K_POST, Ea::Post(r)) => {
+            let a = c.a[(r & 7) as usize];
+            c.a[(r & 7) as usize] = a.wrapping_add(SZ);
+            c.rd(a, SZ)
+        }
+        (K_PRE, Ea::Pre(r)) => {
+            let a = c.a[(r & 7) as usize].wrapping_sub(SZ);
+            c.a[(r & 7) as usize] = a;
+            c.rd(a, SZ)
+        }
+        (K_DISP, Ea::Disp(r, d)) => {
+            let a = c.a[(r & 7) as usize].wrapping_add(d as u32);
+            c.rd(a, SZ)
+        }
+        _ => read(c, e, SZ),
+    }
+}
+
+/// Store to a destination operand of kind K.
+#[inline(always)]
+fn put<const K: u8, const SZ: u32>(c: &mut Cpu, e: Ea, v: u32) {
+    match (K, e) {
+        (K_D, Ea::D(r)) => {
+            let r = (r & 7) as usize;
+            c.d[r] = (c.d[r] & !mask(SZ)) | (v & mask(SZ));
+        }
+        (K_IND, Ea::Ind(r)) => {
+            let a = c.a[(r & 7) as usize];
+            c.wr(a, SZ, v);
+        }
+        (K_POST, Ea::Post(r)) => {
+            let a = c.a[(r & 7) as usize];
+            c.a[(r & 7) as usize] = a.wrapping_add(SZ);
+            c.wr(a, SZ, v);
+        }
+        (K_PRE, Ea::Pre(r)) => {
+            let a = c.a[(r & 7) as usize].wrapping_sub(SZ);
+            c.a[(r & 7) as usize] = a;
+            c.wr(a, SZ, v);
+        }
+        (K_DISP, Ea::Disp(r, d)) => {
+            let a = c.a[(r & 7) as usize].wrapping_add(d as u32);
+            c.wr(a, SZ, v);
+        }
+        _ => {
+            let l = loc(c, e, SZ);
+            c.write_loc(l, SZ, v);
+        }
+    }
+}
+
+/// MOVE specialized on its operand kinds.
+fn h_mv<const SZ: u32, const S: u8, const D: u8>(c: &mut Cpu, o: &Op) {
+    let v = get::<S, SZ>(c, o.a);
+    put::<D, SZ>(c, o.b, v);
     c.set_nz(v, SZ);
+}
+
+/// The <ea>,Dn ALU handler for this operation, size and source.
+fn alu_ea_dn_handler(op: u8, sz: u32, a: Ea) -> Handler {
+    macro_rules! by_kind {
+        ($op:literal, $sz:literal) => {
+            match kind(a) {
+                K_D => h_alu_ea_dn::<$op, $sz, K_D> as Handler,
+                K_IND => h_alu_ea_dn::<$op, $sz, K_IND>,
+                K_POST => h_alu_ea_dn::<$op, $sz, K_POST>,
+                K_DISP => h_alu_ea_dn::<$op, $sz, K_DISP>,
+                K_IMM => h_alu_ea_dn::<$op, $sz, K_IMM>,
+                _ => h_alu_ea_dn::<$op, $sz, K_ANY>,
+            }
+        };
+    }
+    macro_rules! by_size {
+        ($op:literal) => {
+            match sz {
+                1 => by_kind!($op, 1),
+                2 => by_kind!($op, 2),
+                _ => by_kind!($op, 4),
+            }
+        };
+    }
+    match op {
+        0 => by_size!(0),
+        1 => by_size!(1),
+        2 => by_size!(2),
+        3 => by_size!(3),
+        _ => by_size!(5),
+    }
+}
+
+/// The MOVE handler for these operands.
+fn move_handler(sz: u32, a: Ea, b: Ea) -> Handler {
+    macro_rules! by_dst {
+        ($sz:literal, $s:ident) => {
+            match kind(b) {
+                K_D => h_mv::<$sz, $s, K_D> as Handler,
+                K_IND => h_mv::<$sz, $s, K_IND>,
+                K_POST => h_mv::<$sz, $s, K_POST>,
+                K_PRE => h_mv::<$sz, $s, K_PRE>,
+                K_DISP => h_mv::<$sz, $s, K_DISP>,
+                _ => h_mv::<$sz, $s, K_ANY>,
+            }
+        };
+    }
+    macro_rules! by_src {
+        ($sz:literal) => {
+            match kind(a) {
+                K_D => by_dst!($sz, K_D),
+                K_A => by_dst!($sz, K_A),
+                K_IND => by_dst!($sz, K_IND),
+                K_POST => by_dst!($sz, K_POST),
+                K_PRE => by_dst!($sz, K_PRE),
+                K_DISP => by_dst!($sz, K_DISP),
+                K_IMM => by_dst!($sz, K_IMM),
+                _ => by_dst!($sz, K_ANY),
+            }
+        };
+    }
+    match sz {
+        1 => by_src!(1),
+        2 => by_src!(2),
+        _ => by_src!(4),
+    }
 }
 
 fn h_movea<const SZ: u32>(c: &mut Cpu, o: &Op) {
@@ -384,6 +537,26 @@ fn h_movem(c: &mut Cpu, o: &Op) {
     let mut a = addr_of(c, o.a);
     let m = o.x as u16;
     let to_mem = o.r != 0;
+    let n = m.count_ones();
+    if let Some(off) = c.bus.ddr_plain(a, n * 4) {
+        // All in plain DDR: move the registers straight in or out.
+        let mut bits = m;
+        let mut k = off;
+        while bits != 0 {
+            let i = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            if to_mem {
+                let v = c.reg(i);
+                c.bus.ddr[k..k + 4].copy_from_slice(&v.to_be_bytes());
+            } else {
+                let w = &c.bus.ddr[k..k + 4];
+                let v = u32::from_be_bytes([w[0], w[1], w[2], w[3]]);
+                c.set_reg(i, v);
+            }
+            k += 4;
+        }
+        return;
+    }
     for i in 0..16 {
         if m & (1 << i) == 0 {
             continue;
@@ -647,9 +820,9 @@ fn alu(c: &mut Cpu, op: u8, s: u32, d: u32, sz: u32) -> u32 {
     }
 }
 
-/// <ea>,Dn
-fn h_alu_ea_dn<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
-    let s = read(c, o.a, SZ);
+/// <ea>,Dn, specialized on the source kind K.
+fn h_alu_ea_dn<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
+    let s = get::<K, SZ>(c, o.a);
     let dn = o.r as usize;
     let r = alu(c, OP, s, c.d[dn], SZ);
     if OP != 5 {
@@ -667,8 +840,17 @@ fn h_alu_dn_ea<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
     c.write_loc(l, SZ, r);
 }
 
-/// #imm,<ea> (ADDI/SUBI/ANDI/ORI/EORI/CMPI on Dn, ADDQ/SUBQ on any).
-fn h_alu_imm<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
+/// #imm,<ea> (ADDI/SUBI/ANDI/ORI/EORI/CMPI on Dn, ADDQ/SUBQ on any). K is
+/// K_D for a data register destination, K_ANY otherwise.
+fn h_alu_imm<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
+    if K == K_D {
+        let dn = (o.r & 7) as usize;
+        let r = alu(c, OP, o.x, c.d[dn] & mask(SZ), SZ);
+        if OP != 5 {
+            c.d[dn] = (c.d[dn] & !mask(SZ)) | (r & mask(SZ));
+        }
+        return;
+    }
     let l = loc(c, o.b, SZ);
     let d = c.read_loc(l, SZ);
     let r = alu(c, OP, o.x, d, SZ);
@@ -882,11 +1064,7 @@ fn decode_inner(rd: &mut Rd, op: u16) -> Option<Op> {
             if matches!(b, Ea::Imm(_) | Ea::A(_)) {
                 return None;
             }
-            let mut o = mk(match sz {
-                1 => h_move::<1>,
-                2 => h_move::<2>,
-                _ => h_move::<4>,
-            });
+            let mut o = mk(move_handler(sz, a, b));
             o.a = a;
             o.b = b;
             return Some(o);
@@ -916,11 +1094,11 @@ fn decode_inner(rd: &mut Rd, op: u16) -> Option<Op> {
             let f = op & 0xFFF8;
             let r = reg as u8;
             let (h, imm): (Handler, u32) = match f {
-                0x0080 => (h_alu_imm::<3, 4>, rd.l()),
-                0x0280 => (h_alu_imm::<2, 4>, rd.l()),
-                0x0480 => (h_alu_imm::<1, 4>, rd.l()),
-                0x0680 => (h_alu_imm::<0, 4>, rd.l()),
-                0x0A80 => (h_alu_imm::<4, 4>, rd.l()),
+                0x0080 => (h_alu_imm::<3, 4, K_D>, rd.l()),
+                0x0280 => (h_alu_imm::<2, 4, K_D>, rd.l()),
+                0x0480 => (h_alu_imm::<1, 4, K_D>, rd.l()),
+                0x0680 => (h_alu_imm::<0, 4, K_D>, rd.l()),
+                0x0A80 => (h_alu_imm::<4, 4, K_D>, rd.l()),
                 0x0C00 => (h_cmpi_dn::<1>, rd.w() as u32 & 0xFF),
                 0x0C40 => (h_cmpi_dn::<2>, rd.w() as u32),
                 0x0C80 => (h_cmpi_dn::<4>, rd.l()),
@@ -1028,14 +1206,24 @@ fn decode_inner(rd: &mut Rd, op: u16) -> Option<Op> {
                 o.x = if sub { q.wrapping_neg() } else { q };
                 return Some(o);
             }
-            let mut o = mk(match (sub, sz) {
-                (false, 1) => h_alu_imm::<0, 1>,
-                (false, 2) => h_alu_imm::<0, 2>,
-                (false, _) => h_alu_imm::<0, 4>,
-                (true, 1) => h_alu_imm::<1, 1>,
-                (true, 2) => h_alu_imm::<1, 2>,
-                (true, _) => h_alu_imm::<1, 4>,
+            let dn = matches!(b, Ea::D(_));
+            let mut o = mk(match (sub, sz, dn) {
+                (false, 1, true) => h_alu_imm::<0, 1, K_D>,
+                (false, 2, true) => h_alu_imm::<0, 2, K_D>,
+                (false, _, true) => h_alu_imm::<0, 4, K_D>,
+                (true, 1, true) => h_alu_imm::<1, 1, K_D>,
+                (true, 2, true) => h_alu_imm::<1, 2, K_D>,
+                (true, _, true) => h_alu_imm::<1, 4, K_D>,
+                (false, 1, false) => h_alu_imm::<0, 1, K_ANY>,
+                (false, 2, false) => h_alu_imm::<0, 2, K_ANY>,
+                (false, _, false) => h_alu_imm::<0, 4, K_ANY>,
+                (true, 1, false) => h_alu_imm::<1, 1, K_ANY>,
+                (true, 2, false) => h_alu_imm::<1, 2, K_ANY>,
+                (true, _, false) => h_alu_imm::<1, 4, K_ANY>,
             });
+            if let Ea::D(r) = b {
+                o.r = r;
+            }
             o.x = q;
             o.b = b;
             Some(o)
@@ -1103,23 +1291,7 @@ fn decode_inner(rd: &mut Rd, op: u16) -> Option<Op> {
             if opmode <= 2 {
                 let sz = szf(opmode);
                 let a = ea(rd, mode, reg, sz)?;
-                let h: Handler = match (alu_op, sz) {
-                    (0, 1) => h_alu_ea_dn::<0, 1>,
-                    (0, 2) => h_alu_ea_dn::<0, 2>,
-                    (0, _) => h_alu_ea_dn::<0, 4>,
-                    (1, 1) => h_alu_ea_dn::<1, 1>,
-                    (1, 2) => h_alu_ea_dn::<1, 2>,
-                    (1, _) => h_alu_ea_dn::<1, 4>,
-                    (2, 1) => h_alu_ea_dn::<2, 1>,
-                    (2, 2) => h_alu_ea_dn::<2, 2>,
-                    (2, _) => h_alu_ea_dn::<2, 4>,
-                    (3, 1) => h_alu_ea_dn::<3, 1>,
-                    (3, 2) => h_alu_ea_dn::<3, 2>,
-                    (3, _) => h_alu_ea_dn::<3, 4>,
-                    (_, 1) => h_alu_ea_dn::<5, 1>,
-                    (_, 2) => h_alu_ea_dn::<5, 2>,
-                    _ => h_alu_ea_dn::<5, 4>,
-                };
+                let h = alu_ea_dn_handler(alu_op, sz, a);
                 let mut o = mk(h);
                 o.a = a;
                 o.r = rn;

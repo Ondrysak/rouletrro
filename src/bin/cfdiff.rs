@@ -10,6 +10,8 @@ use std::io::{BufRead, Write};
 const CODE: u32 = 0x4000_1000;
 const DATA: u32 = 0x4010_0000;
 const DATA_LEN: usize = 0x1_0000;
+/// DDR the Unicorn side maps, from 0x40000000.
+const MAPPED: usize = 0x20_0000;
 
 fn pattern(i: usize) -> u8 {
     ((i * 37 + 11) & 0xFF) as u8
@@ -21,11 +23,7 @@ fn main() {
         cpu.bus.icache_enable(0x10000);
     }
     let data: Vec<u8> = (0..DATA_LEN).map(pattern).collect();
-    // Every vector points at a marker so an exception is visible.
     cpu.vbr = 0x4000_0000;
-    for v in 0..256u32 {
-        cpu.bus.poke32(0x4000_0000 + v * 4, 0x4000_0800 + v * 2);
-    }
     let stdin = std::io::stdin();
     let mut out = std::io::BufWriter::new(std::io::stdout());
     for line in stdin.lock().lines() {
@@ -37,7 +35,15 @@ fn main() {
         let code: Vec<u8> = (0..f[0].len() / 2)
             .map(|i| u8::from_str_radix(&f[0][2 * i..2 * i + 2], 16).unwrap())
             .collect();
-        cpu.bus.poke_bytes(CODE, &[0u8; 256]);
+        // Unicorn starts each case on fresh memory: so does this side, over
+        // the 2 MB Unicorn maps (a store elsewhere faults there, and the
+        // case is skipped). Every vector points at a marker so an
+        // exception is visible.
+        cpu.bus.ddr[..MAPPED].fill(0);
+        for v in 0..256u32 {
+            cpu.bus.poke32(0x4000_0000 + v * 4, 0x4000_0800 + v * 2);
+        }
+        cpu.bus.icache_flush();
         cpu.bus.poke_bytes(CODE, &code);
         cpu.bus.poke_bytes(DATA, &data);
         for i in 0..8 {

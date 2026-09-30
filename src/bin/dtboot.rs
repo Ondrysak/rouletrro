@@ -29,7 +29,8 @@ counts (suffixes k, M, G).
   --ips N              instructions per emulated second (default 200M)
   --load SNAP          resume a snapshot
   --save SNAP          save a snapshot at the end
-  --card IMAGE         back the eMMC with an image file
+  --card IMAGE         back the eMMC with an image file (read only: changes
+                       are not written back; a missing image starts formatted)
   --press CODE@AT[:HOLD]
                        press key CODE at clock AT for HOLD (default 30M)
   --turn ENC:DELTA@ATxCOUNT[/SPACING]
@@ -145,8 +146,8 @@ fn main() {
         m.cpu.bus.watch = Some((o, o + 4));
     }
     if let Some(p) = &card {
-        m.attach_card(std::path::Path::new(p)).unwrap();
-        println!("card {p}: {} sectors in use", m.cpu.bus.io.esdhc.card.sectors.len());
+        let fresh = m.attach_card(std::path::Path::new(p)).unwrap();
+        println!("card {p}: {} sectors in use{}", m.cpu.bus.io.esdhc.card.sectors.len(), if fresh { " (new, sample area formatted)" } else { "" });
     }
     if let Some(p) = &load {
         dtemu::snapshot::load(&mut m, std::path::Path::new(p)).unwrap();
@@ -309,6 +310,12 @@ fn main() {
             println!("  {o:04x} {f:5.2}% (cum {acc:5.1}%)");
         }
         println!("distinct opcodes: {}", ov.len());
+        let mut blocks: Vec<(u32, u64)> = p.iter().map(|(a, n)| (*a, *n)).collect();
+        blocks.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("hottest blocks:");
+        for (a, n) in blocks.iter().take(20) {
+            println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total as f64);
+        }
         println!("guest profile ({total} samples), by 256-byte region:");
         for (a, n) in v.iter().take(25) {
             println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total as f64);

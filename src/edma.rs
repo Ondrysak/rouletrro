@@ -383,7 +383,7 @@ impl Bus {
         }
         again |= self.io.edma.deferred;
         self.io.edma.deferred = 0;
-        again &= self.io.dma_requesting() | self.io.edma.kick | 0;
+        again &= self.io.dma_requesting() | self.io.edma.kick;
         self.io.edma.kick |= again;
         if self.io.edma.kick != 0 {
             self.run_dma();

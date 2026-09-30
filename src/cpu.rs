@@ -232,6 +232,16 @@ impl Cpu {
         unsafe { *(self as *const Cpu as *const u32).add(n & 15) }
     }
 
+    /// Set Rn as 0-15 (see `reg`).
+    #[inline(always)]
+    pub(crate) fn set_reg(&mut self, n: usize, v: u32) {
+        if n & 8 != 0 {
+            self.a[n & 7] = v;
+        } else {
+            self.d[n & 7] = v;
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn set_nz(&mut self, v: u32, sz: u32) {
         let m = sz_mask(sz);
@@ -509,14 +519,32 @@ impl Cpu {
                 return Stop::Stopped;
             }
             let pc = self.pc;
-            if self.hooked(pc) {
+            // Fast path: a built block. None starts at a hooked PC (hooks
+            // flush the cache, and the slow path below never stores one),
+            // so a hit needs no hook check.
+            if self.history.is_none() {
+                self.bus.icache_settle();
+                if let Some(b) = self.bus.block_at(pc) {
+                    self.run_ops(pc, b);
+                    if let Some((v, p)) = self.last_fault.take() {
+                        let h = self.bus.peek32(self.vbr.wrapping_add(v as u32 * 4));
+                        if h == 0 || h == 0xFFFF_FFFF {
+                            return Stop::Fault(v, p);
+                        }
+                    }
+                    continue;
+                }
+            }
+            let hooked = self.hooked(pc);
+            if hooked {
                 if self.skip_hook != Some(pc) {
                     return Stop::Hook(pc);
                 }
                 self.skip_hook = None;
             }
-            if self.bus.in_code_window(pc) && self.history.is_none() {
-                self.run_block(pc);
+            if !hooked && self.history.is_none() && self.bus.in_code_window(pc) {
+                let b = crate::fast::build_block(self, pc);
+                self.run_ops(pc, b);
             } else {
                 self.op_pc = pc;
                 self.bus.pc = pc;
@@ -537,22 +565,17 @@ impl Cpu {
         }
     }
 
-    /// Run the predecoded block at `pc` (building it first if need be).
-    /// Stops early when control leaves the straight line: a taken branch,
-    /// an exception, STOP.
+    /// Run the predecoded block `blk`, which starts at `pc`. Stops early
+    /// when control leaves the straight line: a taken branch, an
+    /// exception, STOP.
     #[inline(always)]
-    fn run_block(&mut self, pc: u32) {
-        self.bus.icache_settle();
+    fn run_ops(&mut self, pc: u32, blk: *const [crate::fast::Op]) {
         if let Some(p) = &mut self.profile {
             if self.bus.io.now >= self.next_sample {
                 *p.entry(pc).or_insert(0) += 1;
                 self.next_sample = self.bus.io.now + 64;
             }
         }
-        let blk = match self.bus.block_at(pc) {
-            Some(b) => b,
-            None => crate::fast::build_block(self, pc),
-        };
         // SAFETY: blocks are boxed and only dropped by `icache_settle`,
         // which runs between blocks, never while one executes.
         let ops: &[crate::fast::Op] = unsafe { &*blk };
@@ -560,11 +583,18 @@ impl Cpu {
         // block's start otherwise. STOP ends its block, so `stopped` needs
         // no check here.
         self.bus.pc = pc;
-        let exact = self.bus.watch.is_some();
-        let mut pc = pc;
+        if self.bus.watch.is_some() {
+            self.run_ops_loop::<true>(pc, ops)
+        } else {
+            self.run_ops_loop::<false>(pc, ops)
+        }
+    }
+
+    #[inline(always)]
+    fn run_ops_loop<const EXACT: bool>(&mut self, mut pc: u32, ops: &[crate::fast::Op]) {
         for op in ops {
             self.op_pc = pc;
-            if exact {
+            if EXACT {
                 self.bus.pc = pc;
             }
             self.bus.io.now += 1;
@@ -1331,7 +1361,7 @@ impl Cpu {
             let (a, b) = (dv as i32 as i64, s16 as u16 as i16 as i64);
             let q = a / b;
             let r = a % b;
-            (q as u32, r as u32, q < -32768 || q > 32767)
+            (q as u32, r as u32, !(-32768..=32767).contains(&q))
         } else {
             let q = dv / s16;
             (q, dv % s16, q > 0xFFFF)
@@ -1524,7 +1554,7 @@ impl Cpu {
             0xF400 => {
                 // CPUSHL / INTOUCH: no cache is modelled.
                 if !self.supervisor() {
-                    return self.illegal(VEC_PRIV);
+                    self.illegal(VEC_PRIV);
                 }
             }
             0xFB00 => {
