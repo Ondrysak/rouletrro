@@ -8,13 +8,15 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: System libraries (ALSA for sound, X11 for the window)
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libasound2-dev libx11-dev libxcursor-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, so a new clippy's lints arrive as a deliberate bump.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.94.1"
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Build

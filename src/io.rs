@@ -878,12 +878,8 @@ impl Io {
             }
             0xEC07_0000 if size == 1 && a & 3 == 0 => return self.uart_read(8, a & 0x3F),
             0xEC07_4000 if size == 1 && a & 3 == 0 => return self.uart_read(9, a & 0x3F),
-            0xEC09_4000 => {
-                // PPDSDR_C: bit 3 follows the port D bit 4 the board loops back.
-                if a == 0xEC09_401A && size == 1 {
-                    return Some(if self.gpio_d4 { 0x08 } else { 0 });
-                }
-            }
+            // PPDSDR_C: bit 3 follows the port D bit 4 the board loops back.
+            0xEC09_4000 if a == 0xEC09_401A && size == 1 => return Some(if self.gpio_d4 { 0x08 } else { 0 }),
             _ => {}
         }
         None
