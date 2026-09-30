@@ -31,6 +31,7 @@ enum Ev {
 
 struct Audio {
     ring: Mutex<VecDeque<f32>>,
+    /// Underruns heard: the ring ran dry while the output was not silent.
     dropouts: AtomicU64,
     rate: AtomicU64,
     live: AtomicBool,
@@ -225,6 +226,7 @@ fn start_null_audio(audio: Arc<Audio>, keep: Option<Arc<Mutex<Vec<f32>>>>) {
     std::thread::spawn(move || {
         let t0 = Instant::now();
         let mut played = 0u64;
+        let mut last = 0.0f32;
         loop {
             std::thread::sleep(Duration::from_millis(5));
             let due = (t0.elapsed().as_secs_f64() * 48_000.0) as u64;
@@ -237,17 +239,25 @@ fn start_null_audio(audio: Arc<Audio>, keep: Option<Arc<Mutex<Vec<f32>>>>) {
                 continue;
             }
             let mut ring = audio.ring.lock().unwrap();
-            if ring.len() < n * 2 {
-                audio.dropouts.fetch_add(1, Ordering::Relaxed);
-            }
             let take = (n * 2).min(ring.len());
             let got: Vec<f32> = ring.drain(..take).collect();
             drop(ring);
+            if let Some(&x) = got.last() {
+                last = x;
+            }
+            if take < n * 2 && audible(last) {
+                audio.dropouts.fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(k) = &keep {
                 k.lock().unwrap().extend(got);
             }
         }
     });
+}
+
+/// Whether a gap after this sample would be heard (-80 dBFS and up).
+fn audible(x: f32) -> bool {
+    x.abs() > 1e-4
 }
 
 fn start_audio(audio: Arc<Audio>) -> Option<cpal::Stream> {
@@ -268,6 +278,7 @@ fn start_audio(audio: Arc<Audio>) -> Option<cpal::Stream> {
     let channels = cfg.channels() as usize;
     audio.rate.store(cfg.sample_rate().0 as u64, Ordering::Relaxed);
     let a = audio.clone();
+    let mut last = 0.0f32;
     let stream = dev
         .build_output_stream(
             &cfg.config(),
@@ -279,7 +290,15 @@ fn start_audio(audio: Arc<Audio>) -> Option<cpal::Stream> {
                 let mut ring = a.ring.lock().unwrap();
                 let frames = data.len() / channels;
                 if ring.len() < frames * 2 {
-                    a.dropouts.fetch_add(1, Ordering::Relaxed);
+                    // What was already queued plays out first.
+                    if let Some(&x) = ring.back() {
+                        last = x;
+                    }
+                    if audible(last) {
+                        a.dropouts.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if let Some(&x) = ring.get(frames * 2 - 1) {
+                    last = x;
                 }
                 for f in data.chunks_mut(channels) {
                     let l = ring.pop_front().unwrap_or(0.0);
