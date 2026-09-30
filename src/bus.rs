@@ -126,7 +126,7 @@ impl Bus {
     #[inline(always)]
     pub fn block_at(&self, pc: u32) -> Option<*const [Op]> {
         let o = pc.wrapping_sub(CODE_BASE);
-        if o >= self.icache_span {
+        if o >= self.icache_span || o & 1 != 0 {
             return None;
         }
         let id = self.blk_map[(o >> 1) as usize];
@@ -134,6 +134,24 @@ impl Bus {
             return None;
         }
         Some(&*self.blk_arena[(id - 1) as usize] as *const [Op])
+    }
+
+    /// DDR offset of `[a, a + len)` when all of it is plain DDR that no
+    /// watchpoint or cached code covers, so it can be moved directly.
+    #[inline(always)]
+    pub fn ddr_plain(&self, a: u32, len: u32) -> Option<usize> {
+        let o = self.ddr_off(a)?;
+        let end = a.wrapping_add(len - 1);
+        if self.ddr_off(end)? != o + len as usize - 1 || self.watch.is_some() {
+            return None;
+        }
+        // Wholly below or above the cached code, or a store could hit it.
+        let (lo, hi) = (CODE_BASE - 0x4000_0000, CODE_BASE - 0x4000_0000 + self.icache_span);
+        let o32 = o as u32;
+        if o32 + len > lo && o32 < hi {
+            return None;
+        }
+        Some(o)
     }
 
     #[inline(always)]

@@ -309,6 +309,12 @@ fn main() {
             println!("  {o:04x} {f:5.2}% (cum {acc:5.1}%)");
         }
         println!("distinct opcodes: {}", ov.len());
+        let mut blocks: Vec<(u32, u64)> = p.iter().map(|(a, n)| (*a, *n)).collect();
+        blocks.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("hottest blocks:");
+        for (a, n) in blocks.iter().take(20) {
+            println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total as f64);
+        }
         println!("guest profile ({total} samples), by 256-byte region:");
         for (a, n) in v.iter().take(25) {
             println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total as f64);
