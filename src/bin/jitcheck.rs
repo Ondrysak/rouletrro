@@ -40,8 +40,9 @@ fn machine(fw: &Firmware, snap: &str, jit: bool) -> Machine {
     let mut m = Machine::new(fw, 128).unwrap();
     if !jit {
         m.cpu.jit = None;
-    } else if m.cpu.jit.is_none() {
-        m.cpu.jit = Some(Box::new(dtemu::jit::Jit::new(m.cpu.bus.icache_flushes)));
+        m.cpu.jitw = None;
+    } else if m.cpu.jit.is_none() && m.cpu.jitw.is_none() {
+        m.cpu.jitw = Some(dtemu::jit::Worker::new());
     }
     if snap != "-" {
         dtemu::snapshot::load(&mut m, std::path::Path::new(snap)).unwrap();
@@ -169,15 +170,15 @@ fn main() {
         }
     }
     println!("idle-skipped: interp {} jit {}", a.stats.idle_skipped, b.stats.idle_skipped);
-    let j = b.cpu.jit.as_ref().unwrap();
+    let (compiled, failed, secs) = b.cpu.jit_stats();
     println!(
         "identical through clock {t}: {} instructions; interp {ta:.2}s, jit {tb:.2}s ({:.2}x); {} blocks compiled in {:.2}s, {} declined; {} cache flushes; {} entries into compiled code",
         t - start,
         ta / tb.max(1e-9),
-        j.compiled,
-        j.compile_secs,
-        j.failed,
+        compiled,
+        secs,
+        failed,
         b.cpu.bus.icache_flushes,
-        j.runs
+        b.cpu.jit_runs
     );
 }

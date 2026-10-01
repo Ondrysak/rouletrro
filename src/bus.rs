@@ -62,6 +62,8 @@ pub struct Block {
     pub code: Option<crate::jit::BlockFn>,
     /// The compiler declined it; it stays interpreted.
     pub no_jit: bool,
+    /// Sent to the background compiler.
+    pub queued: bool,
 }
 
 /// Where MAIN OS's text starts; the cache covers the image from here.
@@ -179,7 +181,7 @@ impl Bus {
     /// Record a block that starts at `pc` and covers [pc, end).
     pub fn block_store(&mut self, pc: u32, end: u32, ops: Box<[Op]>) -> usize {
         let o = pc.wrapping_sub(CODE_BASE);
-        self.blk_arena.push(Block { ops, hits: 0, code: None, no_jit: false });
+        self.blk_arena.push(Block { ops, hits: 0, code: None, no_jit: false, queued: false });
         let id = self.blk_arena.len() as u32;
         self.blk_map[(o >> 1) as usize] = id;
         let e = end.wrapping_sub(CODE_BASE).min(self.icache_span);

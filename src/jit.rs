@@ -48,15 +48,20 @@ pub struct Jit {
     pub failed: u64,
     /// Time spent compiling, in seconds.
     pub compile_secs: f64,
-    /// Entries into compiled code.
-    pub runs: u64,
     /// Translate operations (false: every op is a handler call).
     pub translate: bool,
 }
 
 fn new_module() -> JITModule {
     let mut flags = settings::builder();
-    flags.set("opt_level", "speed").unwrap();
+    // DTEMU_JIT_OPT / DTEMU_JIT_RA: Cranelift's opt_level and
+    // regalloc_algorithm, for weighing compile time against code speed.
+    // "none" makes code as fast as "speed" here, and compiles faster.
+    let opt = std::env::var("DTEMU_JIT_OPT").unwrap_or_else(|_| "none".into());
+    flags.set("opt_level", &opt).unwrap();
+    if let Ok(ra) = std::env::var("DTEMU_JIT_RA") {
+        flags.set("regalloc_algorithm", &ra).unwrap();
+    }
     flags.set("enable_verifier", "false").unwrap();
     flags.set("use_colocated_libcalls", "false").unwrap();
     flags.set("is_pic", "false").unwrap();
@@ -124,7 +129,6 @@ impl Jit {
             compiled: 0,
             failed: 0,
             compile_secs: 0.0,
-            runs: 0,
             translate: std::env::var_os("DTEMU_JIT_CALLS").is_none(),
         }
     }
@@ -220,6 +224,98 @@ impl Jit {
         let code = module.get_finalized_function(id);
         // SAFETY: the function was built with BlockFn's signature.
         Some(unsafe { std::mem::transmute::<*const u8, BlockFn>(code) })
+    }
+}
+
+/// Compiles blocks on a background thread, so a burst of newly hot code
+/// never stalls the emulator: a block runs interpreted until its code
+/// arrives. The thread owns its compiler and a copy of each block's ops
+/// (the code points at them), both kept until a request from a newer
+/// cache epoch shows the main thread has dropped the old blocks.
+pub struct Worker {
+    tx: std::sync::mpsc::Sender<Req>,
+    rx: std::sync::mpsc::Receiver<Done>,
+    pub stats: std::sync::Arc<WorkerStats>,
+}
+
+#[derive(Default)]
+pub struct WorkerStats {
+    pub compiled: std::sync::atomic::AtomicU64,
+    pub failed: std::sync::atomic::AtomicU64,
+    pub nanos: std::sync::atomic::AtomicU64,
+}
+
+struct Req {
+    idx: usize,
+    epoch: u64,
+    pc: u32,
+    ops: Box<[Op]>,
+    mem: Mem,
+}
+
+/// A compiled block, for block `idx` of cache epoch `epoch`.
+pub struct Done {
+    pub idx: usize,
+    pub epoch: u64,
+    pub f: Option<BlockFn>,
+}
+
+// SAFETY: Mem's pointers are only dereferenced by compiled code the main
+// thread runs; the worker passes them through as constants.
+unsafe impl Send for Req {}
+
+impl Default for Worker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Worker {
+    pub fn new() -> Worker {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (tx, rx_req) = std::sync::mpsc::channel::<Req>();
+        let (tx_done, rx) = std::sync::mpsc::channel::<Done>();
+        let stats = std::sync::Arc::new(WorkerStats::default());
+        let st = stats.clone();
+        std::thread::Builder::new()
+            .name("jit".into())
+            .spawn(move || {
+                let mut jit = Jit::new(0);
+                let mut keep: Vec<Box<[Op]>> = Vec::new();
+                for r in rx_req {
+                    if r.epoch < jit.epoch {
+                        continue;
+                    }
+                    if r.epoch > jit.epoch {
+                        jit.reset(r.epoch);
+                        keep.clear();
+                    }
+                    let t = std::time::Instant::now();
+                    let f = jit.compile(r.pc, &r.ops, r.mem);
+                    st.nanos.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                    if f.is_some() {
+                        st.compiled.fetch_add(1, Relaxed);
+                    } else {
+                        st.failed.fetch_add(1, Relaxed);
+                    }
+                    keep.push(r.ops);
+                    if tx_done.send(Done { idx: r.idx, epoch: r.epoch, f }).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn the jit thread");
+        Worker { tx, rx, stats }
+    }
+
+    /// Ask for block `idx` (cache epoch `epoch`) to be compiled.
+    pub fn queue(&self, idx: usize, epoch: u64, pc: u32, ops: &[Op], mem: Mem) {
+        let _ = self.tx.send(Req { idx, epoch, pc, ops: ops.into(), mem });
+    }
+
+    /// Blocks compiled since the last call.
+    pub fn poll(&self) -> std::sync::mpsc::TryIter<'_, Done> {
+        self.rx.try_iter()
     }
 }
 

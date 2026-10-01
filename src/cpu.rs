@@ -109,8 +109,12 @@ pub struct Cpu {
     next_sample: u64,
     /// A ring of the last executed PCs, when enabled (debugging).
     pub history: Option<(Vec<u32>, usize)>,
-    /// The block compiler; None runs every block on the interpreter.
+    /// The block compiler, compiling in line (tests, cfdiff)...
     pub jit: Option<Box<crate::jit::Jit>>,
+    /// ...or on its own thread (the machine). Neither: interpreter only.
+    pub jitw: Option<crate::jit::Worker>,
+    /// Entries into compiled code.
+    pub jit_runs: u64,
     /// `run`'s clock limit, for compiled loops deciding to go round again.
     pub limit: u64,
     /// The first few faults: (vector, pc, opcode, clock).
@@ -171,6 +175,8 @@ impl Cpu {
             fault_log: Vec::new(),
             history: None,
             jit: None,
+            jitw: None,
+            jit_runs: 0,
             limit: 0,
             profile: None,
             next_sample: 0,
@@ -585,19 +591,19 @@ impl Cpu {
                 self.next_sample = self.bus.io.now + 64;
             }
         }
-        if self.jit.is_some() && self.bus.watch.is_none() {
+        if (self.jit.is_some() || self.jitw.is_some()) && self.bus.watch.is_none() {
             let blk = &mut self.bus.blk_arena[i];
             if let Some(f) = blk.code {
-                if let Some(j) = &mut self.jit {
-                    j.runs += 1;
-                }
+                self.jit_runs += 1;
                 // SAFETY: compiled for this block, which is still cached.
                 unsafe { f(self) };
                 return;
             }
             blk.hits += 1;
             if blk.hits >= crate::jit::HOT && !blk.no_jit {
-                if let Some(f) = self.compile_block(pc, i) {
+                let f = if self.jitw.is_some() { self.jit_async(pc, i) } else { self.compile_block(pc, i) };
+                if let Some(f) = f {
+                    self.jit_runs += 1;
                     // SAFETY: as above.
                     unsafe { f(self) };
                     return;
@@ -606,6 +612,44 @@ impl Cpu {
         }
         let blk: *const [crate::fast::Op] = &*self.bus.blk_arena[i].ops;
         self.run_ops(pc, blk);
+    }
+
+    /// A hot block without code, with the compiler on its thread: send it
+    /// the first time, then take in whatever has been compiled. -> block
+    /// `i`'s code, if it has arrived.
+    #[cold]
+    fn jit_async(&mut self, pc: u32, i: usize) -> Option<crate::jit::BlockFn> {
+        let epoch = self.bus.icache_flushes;
+        if !self.bus.blk_arena[i].queued {
+            self.bus.blk_arena[i].queued = true;
+            let mut mem = crate::jit::Mem::of(&mut self.bus);
+            mem.macsr = self.macsr;
+            let w = self.jitw.as_ref()?;
+            w.queue(i, epoch, pc, &self.bus.blk_arena[i].ops, mem);
+            return None;
+        }
+        let w = self.jitw.as_ref()?;
+        for d in w.poll() {
+            if d.epoch == epoch && d.idx < self.bus.blk_arena.len() {
+                let b = &mut self.bus.blk_arena[d.idx];
+                b.code = d.f;
+                b.no_jit = d.f.is_none();
+            }
+        }
+        self.bus.blk_arena[i].code
+    }
+
+    /// Blocks compiled, declined, and seconds spent compiling.
+    pub fn jit_stats(&self) -> (u64, u64, f64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(w) = &self.jitw {
+            let s = &w.stats;
+            (s.compiled.load(Relaxed), s.failed.load(Relaxed), s.nanos.load(Relaxed) as f64 * 1e-9)
+        } else if let Some(j) = &self.jit {
+            (j.compiled, j.failed, j.compile_secs)
+        } else {
+            (0, 0, 0.0)
+        }
     }
 
     #[cold]

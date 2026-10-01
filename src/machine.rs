@@ -72,9 +72,14 @@ impl Machine {
             bus.icache_enable(os.data.len() as u32);
         }
         let mut cpu = Cpu::new(bus);
-        // The block compiler (DTEMU_NO_JIT=1 runs the interpreter alone).
+        // The block compiler, on its own thread (DTEMU_JIT_SYNC=1: in line;
+        // DTEMU_NO_JIT=1: the interpreter alone).
         if std::env::var_os("DTEMU_NO_JIT").is_none() {
-            cpu.jit = Some(Box::new(crate::jit::Jit::new(cpu.bus.icache_flushes)));
+            if std::env::var_os("DTEMU_JIT_SYNC").is_some() {
+                cpu.jit = Some(Box::new(crate::jit::Jit::new(cpu.bus.icache_flushes)));
+            } else {
+                cpu.jitw = Some(crate::jit::Worker::new());
+            }
         }
         cpu.pc = prof.entry;
         cpu.sr = 0x2700;

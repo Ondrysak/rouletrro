@@ -146,8 +146,11 @@ Encoders: 0–7 are A–H, 8 is LEVEL/DATA.
   host registers within a block, condition codes are computed lazily, DDR
   and SRAM accesses are inline, and a block that branches to itself loops
   natively for as long as the interpreter would run it back to back.
-  Operations it does not translate are calls to their handlers. About 1.7
-  times the interpreter's speed once warm; `DTEMU_NO_JIT=1` turns it off.
+  Operations it does not translate are calls to their handlers. Blocks
+  compile on a background thread (a block runs interpreted until its code
+  arrives), so new code never stalls the audio. About 1.7 times the
+  interpreter's speed once warm; `DTEMU_NO_JIT=1` turns it off,
+  `DTEMU_JIT_SYNC=1` compiles in line.
 - **`bus`**: 128 MB DDR (with aliases), 64 KB SRAM, sparse memory for
   everything else, and the peripheral models.
 - **`io`**, **`edma`**, **`esdhc`**, **`panel`**: the interrupt controllers,
