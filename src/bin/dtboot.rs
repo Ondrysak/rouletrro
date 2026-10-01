@@ -22,7 +22,7 @@ const USAGE: &str = "\
 usage: dtboot [FIRMWARE.syx] [options]
 
 Runs the firmware headless and reports progress. Clocks are instruction
-counts (suffixes k, M, G).
+counts (suffixes k, M, G); after --load they count from the snapshot's.
 
   --instr N            run N instructions (default 100M)
   --every N            report every N (default 10M)
@@ -152,7 +152,18 @@ fn main() {
     if let Some(p) = &load {
         dtemu::snapshot::load(&mut m, std::path::Path::new(p)).unwrap();
         println!("restored {p} at clock {}", m.now());
-        instr += m.now();
+        // Every clock given counts from the snapshot's.
+        let base = m.now();
+        instr += base;
+        for p in &mut presses {
+            p.1 += base;
+        }
+        for t in &mut turns {
+            t.0 += base;
+        }
+        if let Some(pa) = &mut profile_after {
+            *pa += base;
+        }
     }
     let t0 = Instant::now();
     let (clock0, idle0) = (m.now(), m.stats.idle_skipped);

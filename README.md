@@ -178,6 +178,9 @@ pip install unicorn capstone
 python3 tools/cfdiff.py 4000      # random instructions against Unicorn's M68K
 CFDIFF_JIT=1 python3 tools/cfdiff.py 4000   # the same through the block compiler
 ./target/release/jitcheck snapshots/x.snap --instr 1G   # compiler vs interpreter
+# the audio itself, sample for sample: place two trigs, PLAY, turn, STOP
+A="--load snapshots/x.snap --instr 5G --press 24@200M --press 25@400M --press 10@700M --turn 0:3@1500Mx8/20M --press 11@4600M"
+./target/release/dtboot $A --wav jit.wav && DTEMU_NO_JIT=1 ./target/release/dtboot $A --wav interp.wav && cmp jit.wav interp.wav
 ./target/release/fwinfo fw/Digitakt_OS1.53.syx -o sections   # extract, then:
 python3 tools/cfdis.py 40075e00 +100   # disassemble MAIN OS
 ```
