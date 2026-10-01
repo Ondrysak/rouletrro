@@ -13,7 +13,7 @@
 
 use crate::cpu::{Cpu, Loc, CF_C, CF_N, CF_V, CF_X, CF_Z};
 
-pub type Handler = fn(&mut Cpu, &Op);
+pub type Handler = extern "C" fn(&mut Cpu, &Op);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Ea {
@@ -31,9 +31,140 @@ pub enum Ea {
     Imm(u32),
 }
 
+/// What an op is, for the block compiler (`jit`), which translates the
+/// common ones itself; `Call` runs the handler. Sizes are in bytes; ALU
+/// operations number as `alu` does (0 add, 1 sub, 2 and, 3 or, 4 eor,
+/// 5 cmp).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Kind {
+    Call,
+    /// MOVE a -> b.
+    Move { sz: u8 },
+    /// MOVEA a -> A(r).
+    MoveA { sz: u8 },
+    /// MOVEQ #x -> D(r).
+    MoveQ,
+    /// MVS / MVZ a -> D(r).
+    Mvs { sz: u8 },
+    Mvz { sz: u8 },
+    /// LEA a -> A(r).
+    Lea,
+    /// <a> op D(r) -> D(r).
+    AluEaDn { op: u8, sz: u8 },
+    /// #x op <b> -> <b> (ADDI.. on Dn, ADDQ/SUBQ on any).
+    AluImm { op: u8, sz: u8 },
+    /// ADDA/SUBA/CMPA a, A(r).
+    AluAn { op: u8, sz: u8 },
+    /// ADDQ/SUBQ to A(r): add x.
+    QuickAn,
+    /// CMPI #x, D(r).
+    CmpiDn { sz: u8 },
+    /// Bcc (condition r) / BRA to x.
+    Bcc,
+    Bra,
+    Clr { sz: u8 },
+    Tst { sz: u8 },
+    /// Register shift: kind 0 left, 1 LSR, 2 ASR; count x or D(x).
+    Shift { kind: u8, reg: bool },
+    /// ADDX/SUBX.L D(x), D(r).
+    Addx { sub: bool },
+    /// MAC/MSAC (`h_mac_f`): load mode lm (0 none, 2-5 the EA mode),
+    /// long operands; `x` as `h_mac` packs it, displacement in `a`.
+    Mac { lm: u8, long: bool },
+    /// MOVE.L ACC(x & 3), R(r) (0-15), clearing it if x & 0x100.
+    MovAcc,
+    /// SATS.L D(r).
+    Sats,
+    /// SWAP D(r).
+    Swap,
+    /// MOVEM between registers (mask x) and a (to memory if r != 0).
+    Movem,
+    /// BTST/BCHG/BCLR/BSET D(x), D(r): kind 0-3.
+    BitDn { kind: u8 },
+    /// EOR D(x), D(r) at size.
+    EorDn { sz: u8 },
+}
+
+/// The kind of a natively decoded op (see `Kind`).
+fn classify(o: &Op) -> Kind {
+    let op = o.op;
+    let opmode = (op >> 6) & 7;
+    match op >> 12 {
+        0x1..=0x3 => {
+            let sz = [0, 1, 4, 2][(op >> 12) as usize];
+            if opmode == 1 { Kind::MoveA { sz } } else { Kind::Move { sz } }
+        }
+        0x6 => match (op >> 8) & 15 {
+            0 => Kind::Bra,
+            1 => Kind::Call,
+            _ => Kind::Bcc,
+        },
+        0x0 => match op & 0xFFF8 {
+            0x0080 => Kind::AluImm { op: 3, sz: 4 },
+            0x0280 => Kind::AluImm { op: 2, sz: 4 },
+            0x0480 => Kind::AluImm { op: 1, sz: 4 },
+            0x0680 => Kind::AluImm { op: 0, sz: 4 },
+            0x0A80 => Kind::AluImm { op: 4, sz: 4 },
+            0x0C00 => Kind::CmpiDn { sz: 1 },
+            0x0C40 => Kind::CmpiDn { sz: 2 },
+            0x0C80 => Kind::CmpiDn { sz: 4 },
+            _ => Kind::Call,
+        },
+        0x4 => {
+            let ss = (op >> 6) & 3;
+            if op & 0x01C0 == 0x01C0 && op & 0xFFF8 != 0x49C0 {
+                Kind::Lea
+            } else if matches!(op & 0xFFC0, 0x48C0 | 0x4CC0) {
+                Kind::Movem
+            } else if op & 0xFF00 == 0x4200 && ss != 3 {
+                Kind::Clr { sz: szf(ss) as u8 }
+            } else if op & 0xFF00 == 0x4A00 && ss != 3 {
+                Kind::Tst { sz: szf(ss) as u8 }
+            } else {
+                Kind::Call
+            }
+        }
+        0x5 => {
+            if (op >> 3) & 7 == 1 {
+                Kind::QuickAn
+            } else {
+                Kind::AluImm { op: ((op >> 8) & 1) as u8, sz: szf((op >> 6) & 3) as u8 }
+            }
+        }
+        0x7 => {
+            if op & 0x100 == 0 {
+                Kind::MoveQ
+            } else {
+                let sz = if (op >> 6) & 1 == 0 { 1 } else { 2 };
+                if (op >> 7) & 1 == 0 { Kind::Mvs { sz } } else { Kind::Mvz { sz } }
+            }
+        }
+        0xA if op & 0x0100 == 0 => {
+            let load = op & 0x30 != 0;
+            Kind::Mac { lm: if load { ((op >> 3) & 7) as u8 } else { 0 }, long: o.x & 0x0800 != 0 }
+        }
+        0x8 | 0x9 | 0xB | 0xC | 0xD => {
+            let alu = match op >> 12 {
+                0xD => 0,
+                0x9 => 1,
+                0xC => 2,
+                0x8 => 3,
+                _ => 5,
+            };
+            match opmode {
+                3 | 7 if matches!(op >> 12, 0x9 | 0xB | 0xD) => Kind::AluAn { op: alu, sz: if opmode == 3 { 2 } else { 4 } },
+                0..=2 if !(op >> 12 == 0xC && opmode == 3) => Kind::AluEaDn { op: alu, sz: szf(opmode) as u8 },
+                _ => Kind::Call,
+            }
+        }
+        _ => Kind::Call,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Op {
     pub h: Handler,
+    pub k: Kind,
     /// Length in bytes; the handler runs with PC already past it.
     pub len: u8,
     /// Ends its block: control flow, an SR write, or an interpreter fallback.
@@ -46,32 +177,32 @@ pub struct Op {
 }
 
 /// Anything not predecoded: the reference interpreter, from the top.
-fn h_slow(c: &mut Cpu, _o: &Op) {
+extern "C" fn h_slow(c: &mut Cpu, _o: &Op) {
     c.pc = c.op_pc;
     c.execute();
 }
 
 /// A single-word instruction: the interpreter's dispatch without the fetch.
-fn h_word(c: &mut Cpu, o: &Op) {
+extern "C" fn h_word(c: &mut Cpu, o: &Op) {
     c.dispatch(o.op);
 }
 
 /// `h_word` with the line already chosen.
 fn h_word_line(op: u16) -> Handler {
-    fn l0(c: &mut Cpu, o: &Op) { c.line0(o.op) }
-    fn l1(c: &mut Cpu, o: &Op) { c.op_move(o.op, 1) }
-    fn l2(c: &mut Cpu, o: &Op) { c.op_move(o.op, 4) }
-    fn l3(c: &mut Cpu, o: &Op) { c.op_move(o.op, 2) }
-    fn l4(c: &mut Cpu, o: &Op) { c.line4(o.op) }
-    fn l5(c: &mut Cpu, o: &Op) { c.line5(o.op) }
-    fn l7(c: &mut Cpu, o: &Op) { c.line7(o.op) }
-    fn l8(c: &mut Cpu, o: &Op) { c.line8(o.op) }
-    fn l9(c: &mut Cpu, o: &Op) { c.line9d(o.op, false) }
-    fn la(c: &mut Cpu, o: &Op) { c.linea(o.op) }
-    fn lb(c: &mut Cpu, o: &Op) { c.lineb(o.op) }
-    fn lc(c: &mut Cpu, o: &Op) { c.linec(o.op) }
-    fn ld(c: &mut Cpu, o: &Op) { c.line9d(o.op, true) }
-    fn le(c: &mut Cpu, o: &Op) { c.linee(o.op) }
+    extern "C" fn l0(c: &mut Cpu, o: &Op) { c.line0(o.op) }
+    extern "C" fn l1(c: &mut Cpu, o: &Op) { c.op_move(o.op, 1) }
+    extern "C" fn l2(c: &mut Cpu, o: &Op) { c.op_move(o.op, 4) }
+    extern "C" fn l3(c: &mut Cpu, o: &Op) { c.op_move(o.op, 2) }
+    extern "C" fn l4(c: &mut Cpu, o: &Op) { c.line4(o.op) }
+    extern "C" fn l5(c: &mut Cpu, o: &Op) { c.line5(o.op) }
+    extern "C" fn l7(c: &mut Cpu, o: &Op) { c.line7(o.op) }
+    extern "C" fn l8(c: &mut Cpu, o: &Op) { c.line8(o.op) }
+    extern "C" fn l9(c: &mut Cpu, o: &Op) { c.line9d(o.op, false) }
+    extern "C" fn la(c: &mut Cpu, o: &Op) { c.linea(o.op) }
+    extern "C" fn lb(c: &mut Cpu, o: &Op) { c.lineb(o.op) }
+    extern "C" fn lc(c: &mut Cpu, o: &Op) { c.linec(o.op) }
+    extern "C" fn ld(c: &mut Cpu, o: &Op) { c.line9d(o.op, true) }
+    extern "C" fn le(c: &mut Cpu, o: &Op) { c.linee(o.op) }
     match op >> 12 {
         0x0 => l0,
         0x1 => l1,
@@ -94,7 +225,7 @@ fn h_word_line(op: u16) -> Handler {
 /// Register shifts. KIND: 0 left (ASL/LSL: ColdFire's ASL clears V like
 /// LSL), 1 LSR, 2 ASR. `r` is the data register, `x` the count, or with
 /// REG the count register.
-fn h_shift<const KIND: u8, const REG: bool>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_shift<const KIND: u8, const REG: bool>(c: &mut Cpu, o: &Op) {
     let count = if REG { c.d[o.x as usize] & 63 } else { o.x };
     let v = c.d[o.r as usize];
     let mut ccr = c.sr & !0x1F;
@@ -134,7 +265,7 @@ fn h_shift<const KIND: u8, const REG: bool>(c: &mut Cpu, o: &Op) {
 }
 
 /// ADDX.L / SUBX.L Dy,Dx: `r` = Dx, `x` = Dy.
-fn h_addx<const SUB: bool>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_addx<const SUB: bool>(c: &mut Cpu, o: &Op) {
     let x = c.sr & CF_X != 0;
     let z = c.sr & CF_Z;
     let (s, d) = (c.d[o.x as usize], c.d[o.r as usize]);
@@ -146,7 +277,7 @@ fn h_addx<const SUB: bool>(c: &mut Cpu, o: &Op) {
 }
 
 /// MOVE.L ACCy,Rx / MOVCLR.L: `r` = Rx as 0-15, `x` = y | clear << 8.
-fn h_movacc(c: &mut Cpu, o: &Op) {
+extern "C" fn h_movacc(c: &mut Cpu, o: &Op) {
     use crate::cpu::MACSR_PAV0;
     use crate::cpu::{MACSR_FI, MACSR_OMC, MACSR_RT, MACSR_SU};
     let i = (o.x & 3) as usize;
@@ -176,6 +307,31 @@ fn h_movacc(c: &mut Cpu, o: &Op) {
 /// A single-word instruction with a native handler, if it has one.
 fn word_native(op: u16) -> Option<Op> {
     let r = (op & 7) as u8;
+    if op >> 12 == 0 && op & 0x0138 == 0x0100 {
+        // BTST..BSET Dx,Dy: the interpreter runs them; the block compiler
+        // translates them.
+        let mut o = mk(h_word_line(op));
+        o.r = r;
+        o.x = ((op >> 9) & 7) as u32;
+        o.k = Kind::BitDn { kind: ((op >> 6) & 3) as u8 };
+        return Some(o);
+    }
+    if op >> 12 == 0xB && (op >> 6) & 7 >= 4 && (op >> 6) & 7 <= 6 && (op >> 3) & 7 == 0 {
+        // EOR Dx,Dy, likewise.
+        let mut o = mk(h_word_line(op));
+        o.r = r;
+        o.x = ((op >> 9) & 7) as u32;
+        o.k = Kind::EorDn { sz: [1, 2, 4][((op >> 6) & 7) as usize - 4] };
+        return Some(o);
+    }
+    if matches!(op & 0xFFF8, 0x4C80 | 0x4840) {
+        // SATS / SWAP: the interpreter runs them; the block compiler
+        // translates them.
+        let mut o = mk(h_word_line(op));
+        o.r = r;
+        o.k = if op & 0xFFF8 == 0x4C80 { Kind::Sats } else { Kind::Swap };
+        return Some(o);
+    }
     match op >> 12 {
         0xE if (op >> 6) & 3 == 2 && (op >> 3) & 3 <= 1 => {
             let left = op & 0x100 != 0;
@@ -192,18 +348,21 @@ fn word_native(op: u16) -> Option<Op> {
             });
             o.r = r;
             o.x = if reg { f } else if f == 0 { 8 } else { f };
+            o.k = Kind::Shift { kind, reg };
             Some(o)
         }
         0x9 | 0xD if op & 0x01F8 == 0x0180 => {
             let mut o = mk(if op >> 12 == 0x9 { h_addx::<true> } else { h_addx::<false> });
             o.r = ((op >> 9) & 7) as u8;
             o.x = r as u32;
+            o.k = Kind::Addx { sub: op >> 12 == 0x9 };
             Some(o)
         }
         0xA if op & 0xF9B0 == 0xA180 => {
             let mut o = mk(h_movacc);
             o.r = (op & 0xF) as u8;
             o.x = ((op >> 9) & 3) as u32 | if op & 0x40 != 0 { 0x100 } else { 0 };
+            o.k = Kind::MovAcc;
             Some(o)
         }
         _ => None,
@@ -377,7 +536,7 @@ fn put<const K: u8, const SZ: u32>(c: &mut Cpu, e: Ea, v: u32) {
 }
 
 /// MOVE specialized on its operand kinds.
-fn h_mv<const SZ: u32, const S: u8, const D: u8>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mv<const SZ: u32, const S: u8, const D: u8>(c: &mut Cpu, o: &Op) {
     let v = get::<S, SZ>(c, o.a);
     put::<D, SZ>(c, o.b, v);
     c.set_nz(v, SZ);
@@ -450,71 +609,71 @@ fn move_handler(sz: u32, a: Ea, b: Ea) -> Handler {
     }
 }
 
-fn h_movea<const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_movea<const SZ: u32>(c: &mut Cpu, o: &Op) {
     let v = read(c, o.a, SZ);
     c.a[o.r as usize] = sext(v, SZ);
 }
 
-fn h_mvs<const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mvs<const SZ: u32>(c: &mut Cpu, o: &Op) {
     let v = sext(read(c, o.a, SZ), SZ);
     c.d[o.r as usize] = v;
     c.set_nz(v, 4);
 }
 
-fn h_mvz<const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mvz<const SZ: u32>(c: &mut Cpu, o: &Op) {
     let v = read(c, o.a, SZ);
     c.d[o.r as usize] = v;
     c.set_nz(v, 4);
 }
 
-fn h_moveq(c: &mut Cpu, o: &Op) {
+extern "C" fn h_moveq(c: &mut Cpu, o: &Op) {
     c.d[o.r as usize] = o.x;
     c.set_nz(o.x, 4);
 }
 
-fn h_mov3q(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mov3q(c: &mut Cpu, o: &Op) {
     let l = loc(c, o.b, 4);
     c.write_loc(l, 4, o.x);
     c.set_nz(o.x, 4);
 }
 
-fn h_lea(c: &mut Cpu, o: &Op) {
+extern "C" fn h_lea(c: &mut Cpu, o: &Op) {
     c.a[o.r as usize] = addr_of(c, o.a);
 }
 
-fn h_pea(c: &mut Cpu, o: &Op) {
+extern "C" fn h_pea(c: &mut Cpu, o: &Op) {
     let a = addr_of(c, o.a);
     c.push32(a);
 }
 
-fn h_jsr(c: &mut Cpu, o: &Op) {
+extern "C" fn h_jsr(c: &mut Cpu, o: &Op) {
     let t = addr_of(c, o.a);
     let ret = c.pc;
     c.push32(ret);
     c.pc = t;
 }
 
-fn h_jmp(c: &mut Cpu, o: &Op) {
+extern "C" fn h_jmp(c: &mut Cpu, o: &Op) {
     c.pc = addr_of(c, o.a);
 }
 
-fn h_bra(c: &mut Cpu, o: &Op) {
+extern "C" fn h_bra(c: &mut Cpu, o: &Op) {
     c.pc = o.x;
 }
 
-fn h_bsr(c: &mut Cpu, o: &Op) {
+extern "C" fn h_bsr(c: &mut Cpu, o: &Op) {
     let ret = c.pc;
     c.push32(ret);
     c.pc = o.x;
 }
 
-fn h_bcc(c: &mut Cpu, o: &Op) {
+extern "C" fn h_bcc(c: &mut Cpu, o: &Op) {
     if c.cond(o.r as u16) {
         c.pc = o.x;
     }
 }
 
-fn h_link(c: &mut Cpu, o: &Op) {
+extern "C" fn h_link(c: &mut Cpu, o: &Op) {
     let r = o.r as usize;
     let v = c.a[r];
     c.push32(v);
@@ -522,18 +681,18 @@ fn h_link(c: &mut Cpu, o: &Op) {
     c.a[7] = c.a[7].wrapping_add(o.x);
 }
 
-fn h_clr<const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_clr<const SZ: u32>(c: &mut Cpu, o: &Op) {
     let l = loc(c, o.b, SZ);
     c.write_loc(l, SZ, 0);
     c.sr = (c.sr & !0x0F) | CF_Z;
 }
 
-fn h_tst<const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_tst<const SZ: u32>(c: &mut Cpu, o: &Op) {
     let v = read(c, o.a, SZ);
     c.set_nz(v, SZ);
 }
 
-fn h_movem(c: &mut Cpu, o: &Op) {
+extern "C" fn h_movem(c: &mut Cpu, o: &Op) {
     let mut a = addr_of(c, o.a);
     let m = o.x as u16;
     let to_mem = o.r != 0;
@@ -580,7 +739,7 @@ fn h_movem(c: &mut Cpu, o: &Op) {
 /// engine's resampler and mixer. LM is the load's addressing mode (0 none,
 /// 2 (An), 3 (An)+, 4 -(An), 5 (d16,An)); LONG takes 32-bit operands.
 /// Anything else at run time goes to `h_mac`.
-fn h_mac_f<const LM: u8, const LONG: bool>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mac_f<const LM: u8, const LONG: bool>(c: &mut Cpu, o: &Op) {
     use crate::cpu::{MACSR_FI, MACSR_OMC, MACSR_PAV0, MACSR_RT, MACSR_SU, MACSR_V};
     let m = c.macsr;
     if m & (MACSR_RT | MACSR_SU | MACSR_FI) != MACSR_FI {
@@ -666,7 +825,7 @@ fn h_mac_f<const LM: u8, const LONG: bool>(c: &mut Cpu, o: &Op) {
 /// The two modes the audio engine runs in -- signed fractional and signed
 /// integer, with or without OMC, no rounding -- are computed inline; the
 /// rest go to the general `mac_core`.
-fn h_mac(c: &mut Cpu, o: &Op) {
+pub extern "C" fn h_mac(c: &mut Cpu, o: &Op) {
     use crate::cpu::{MACSR_FI, MACSR_OMC, MACSR_PAV0, MACSR_RT, MACSR_SU, MACSR_V};
     let m = c.macsr;
     let fast_mode = m & (MACSR_RT | MACSR_SU) == 0;
@@ -821,7 +980,7 @@ fn alu(c: &mut Cpu, op: u8, s: u32, d: u32, sz: u32) -> u32 {
 }
 
 /// <ea>,Dn, specialized on the source kind K.
-fn h_alu_ea_dn<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_alu_ea_dn<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
     let s = get::<K, SZ>(c, o.a);
     let dn = o.r as usize;
     let r = alu(c, OP, s, c.d[dn], SZ);
@@ -832,7 +991,7 @@ fn h_alu_ea_dn<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
 }
 
 /// Dn,<ea>
-fn h_alu_dn_ea<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_alu_dn_ea<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
     let l = loc(c, o.b, SZ);
     let d = c.read_loc(l, SZ);
     let s = c.d[o.r as usize];
@@ -842,7 +1001,7 @@ fn h_alu_dn_ea<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
 
 /// #imm,<ea> (ADDI/SUBI/ANDI/ORI/EORI/CMPI on Dn, ADDQ/SUBQ on any). K is
 /// K_D for a data register destination, K_ANY otherwise.
-fn h_alu_imm<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_alu_imm<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
     if K == K_D {
         let dn = (o.r & 7) as usize;
         let r = alu(c, OP, o.x, c.d[dn] & mask(SZ), SZ);
@@ -860,7 +1019,7 @@ fn h_alu_imm<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
 }
 
 /// ADDA/SUBA/CMPA <ea>,An. OP: 0 add, 1 sub, 5 cmp.
-fn h_alu_an<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_alu_an<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
     let s = sext(read(c, o.a, SZ), SZ);
     let an = o.r as usize;
     match OP {
@@ -873,12 +1032,12 @@ fn h_alu_an<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
     }
 }
 
-fn h_quick_an(c: &mut Cpu, o: &Op) {
+extern "C" fn h_quick_an(c: &mut Cpu, o: &Op) {
     let r = o.r as usize;
     c.a[r] = c.a[r].wrapping_add(o.x);
 }
 
-fn h_mul_w<const SIGNED: bool>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mul_w<const SIGNED: bool>(c: &mut Cpu, o: &Op) {
     let s = read(c, o.a, 2);
     let dn = o.r as usize;
     let r = if SIGNED {
@@ -890,7 +1049,7 @@ fn h_mul_w<const SIGNED: bool>(c: &mut Cpu, o: &Op) {
     c.set_nz(r, 4);
 }
 
-fn h_mul_l(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mul_l(c: &mut Cpu, o: &Op) {
     let s = read(c, o.a, 4);
     let dl = o.r as usize;
     let r = if o.x & 0x0800 != 0 {
@@ -902,7 +1061,7 @@ fn h_mul_l(c: &mut Cpu, o: &Op) {
     c.set_nz(r, 4);
 }
 
-fn h_cmpi_dn<const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_cmpi_dn<const SZ: u32>(c: &mut Cpu, o: &Op) {
     let d = c.d[o.r as usize];
     c.cmp_flags(o.x, d, SZ);
 }
@@ -979,6 +1138,7 @@ pub fn decode(c: &Cpu, pc: u32) -> Op {
         Some(mut o) => {
             o.op = op;
             o.len = (rd.p.wrapping_sub(pc)) as u8;
+            o.k = classify(&o);
             o.end |= matches!(op >> 12, 0x6) || matches!(op & 0xFFC0, 0x4E80 | 0x4EC0);
             o
         }
@@ -1001,7 +1161,7 @@ pub fn decode(c: &Cpu, pc: u32) -> Op {
 }
 
 /// Decode a basic block at `pc` and store it. -> the block.
-pub fn build_block(c: &mut Cpu, pc: u32) -> *const [Op] {
+pub fn build_block(c: &mut Cpu, pc: u32) -> usize {
     let mut ops = Vec::with_capacity(8);
     let mut p = pc;
     loop {
@@ -1017,7 +1177,7 @@ pub fn build_block(c: &mut Cpu, pc: u32) -> *const [Op] {
 }
 
 fn mk(h: Handler) -> Op {
-    Op { h, len: 0, end: false, r: 0, op: 0, a: Ea::D(0), b: Ea::D(0), x: 0 }
+    Op { h, k: Kind::Call, len: 0, end: false, r: 0, op: 0, a: Ea::D(0), b: Ea::D(0), x: 0 }
 }
 
 fn single_word(op: u16) -> bool {

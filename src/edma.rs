@@ -186,10 +186,9 @@ impl Bus {
             let unit = ssize.min(4);
             for k in 0..ssize / unit {
                 let v = self.dma_read(s.wrapping_add(k * unit), unit);
-                for b in (0..unit).rev() {
-                    buf[len] = (v >> (8 * b)) as u8;
-                    len += 1;
-                }
+                let u = unit as usize;
+                buf[len..len + u].copy_from_slice(&v.to_be_bytes()[4 - u..]);
+                len += u;
             }
             moved += ssize;
             s = modulo_add(s, soff, smod);
@@ -199,11 +198,10 @@ impl Bus {
             let unit = dsize.min(4);
             for k in 0..dsize / unit {
                 let off = (written + k * unit) as usize;
-                let mut v = 0u32;
-                for b in &buf[off..off + unit as usize] {
-                    v = v << 8 | *b as u32;
-                }
-                self.dma_write(d.wrapping_add(k * unit), unit, v);
+                let mut w = [0u8; 4];
+                let u = unit as usize;
+                w[4 - u..].copy_from_slice(&buf[off..off + u]);
+                self.dma_write(d.wrapping_add(k * unit), unit, u32::from_be_bytes(w));
             }
             written += dsize;
             d = modulo_add(d, doff, dmod);
@@ -214,21 +212,26 @@ impl Bus {
     /// Minor loop bookkeeping: the new addresses and count, the half and
     /// major completions, the minor link.
     fn dma_minor_done(&mut self, ch: usize, citer: u16, s: u32, d: u32) -> bool {
-        let mut t = self.tcd(ch); // the transfer may have touched TCD space
-        t.saddr = s;
-        t.daddr = d;
+        // Only the addresses, the count and CSR change: update them in
+        // place (re-reading the rest, which the transfer may have written).
+        let b = &mut self.io.edma.tcd[ch * 32..ch * 32 + 32];
+        let raw_citer = u16::from_be_bytes([b[0x14], b[0x15]]);
+        let biter = u16::from_be_bytes([b[0x1C], b[0x1D]]);
+        let csr = u16::from_be_bytes([b[0x1E], b[0x1F]]);
         let new_count = citer - 1;
-        t.citer = (t.citer & !(if t.citer & 0x8000 != 0 { 0x01FF } else { 0x7FFF })) | new_count;
-        t.csr = (t.csr & !CSR_START) | CSR_ACTIVE;
-        t.csr &= !CSR_DONE;
-        self.set_tcd(ch, &t);
-        let half = Tcd::count(t.biter) / 2;
-        if t.csr & CSR_INTHALF != 0 && new_count == half && half != 0 {
+        let new_citer = (raw_citer & !(if raw_citer & 0x8000 != 0 { 0x01FF } else { 0x7FFF })) | new_count;
+        let new_csr = ((csr & !CSR_START) | CSR_ACTIVE) & !CSR_DONE;
+        b[0..4].copy_from_slice(&s.to_be_bytes());
+        b[0x10..0x14].copy_from_slice(&d.to_be_bytes());
+        b[0x14..0x16].copy_from_slice(&new_citer.to_be_bytes());
+        b[0x1E..0x20].copy_from_slice(&new_csr.to_be_bytes());
+        let half = Tcd::count(biter) / 2;
+        if new_csr & CSR_INTHALF != 0 && new_count == half && half != 0 {
             self.io.edma.int |= 1 << ch;
         }
         if new_count == 0 {
             self.dma_major_done(ch);
-        } else if let Some(l) = Tcd::link(t.citer) {
+        } else if let Some(l) = Tcd::link(new_citer) {
             if l != ch {
                 self.dma_start_linked(l);
             }

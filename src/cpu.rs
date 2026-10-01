@@ -65,6 +65,9 @@ pub(crate) enum Loc {
     I(u32),
 }
 
+// `reg` and the block compiler index Rn as 0-15 from the struct's start.
+const _: () = assert!(std::mem::offset_of!(Cpu, d) == 0 && std::mem::offset_of!(Cpu, a) == 32);
+
 /// `repr(C)` keeps `a` straight after `d`, so `reg` can index Rn as 0-15.
 #[repr(C)]
 pub struct Cpu {
@@ -106,6 +109,14 @@ pub struct Cpu {
     next_sample: u64,
     /// A ring of the last executed PCs, when enabled (debugging).
     pub history: Option<(Vec<u32>, usize)>,
+    /// The block compiler, compiling in line (tests, cfdiff)...
+    pub jit: Option<Box<crate::jit::Jit>>,
+    /// ...or on its own thread (the machine). Neither: interpreter only.
+    pub jitw: Option<crate::jit::Worker>,
+    /// Entries into compiled code.
+    pub jit_runs: u64,
+    /// `run`'s clock limit, for compiled loops deciding to go round again.
+    pub limit: u64,
     /// The first few faults: (vector, pc, opcode, clock).
     pub fault_log: Vec<(u8, u32, u16, u64)>,
 }
@@ -163,6 +174,10 @@ impl Cpu {
             exc_counts: [0; 256],
             fault_log: Vec::new(),
             history: None,
+            jit: None,
+            jitw: None,
+            jit_runs: 0,
+            limit: 0,
             profile: None,
             next_sample: 0,
         }
@@ -499,6 +514,7 @@ impl Cpu {
     /// Execute until the clock reaches `until`, a peripheral event falls
     /// due, a hook is hit, or the core stops with nothing to wake it.
     pub fn run(&mut self, until: u64) -> Stop {
+        self.limit = until;
         loop {
             // Interrupts are sampled between instructions.
             let lvl = self.bus.io.irq_level;
@@ -524,8 +540,8 @@ impl Cpu {
             // so a hit needs no hook check.
             if self.history.is_none() {
                 self.bus.icache_settle();
-                if let Some(b) = self.bus.block_at(pc) {
-                    self.run_ops(pc, b);
+                if let Some(i) = self.bus.block_at(pc) {
+                    self.run_block(pc, i);
                     if let Some((v, p)) = self.last_fault.take() {
                         let h = self.bus.peek32(self.vbr.wrapping_add(v as u32 * 4));
                         if h == 0 || h == 0xFFFF_FFFF {
@@ -543,8 +559,8 @@ impl Cpu {
                 self.skip_hook = None;
             }
             if !hooked && self.history.is_none() && self.bus.in_code_window(pc) {
-                let b = crate::fast::build_block(self, pc);
-                self.run_ops(pc, b);
+                let i = crate::fast::build_block(self, pc);
+                self.run_block(pc, i);
             } else {
                 self.op_pc = pc;
                 self.bus.pc = pc;
@@ -565,17 +581,128 @@ impl Cpu {
         }
     }
 
-    /// Run the predecoded block `blk`, which starts at `pc`. Stops early
-    /// when control leaves the straight line: a taken branch, an
-    /// exception, STOP.
+    /// Run block `i` of the cache, which starts at `pc`: its compiled code
+    /// if it has some (compiling it once it runs hot), else its ops.
     #[inline(always)]
-    fn run_ops(&mut self, pc: u32, blk: *const [crate::fast::Op]) {
+    fn run_block(&mut self, pc: u32, i: usize) {
         if let Some(p) = &mut self.profile {
             if self.bus.io.now >= self.next_sample {
                 *p.entry(pc).or_insert(0) += 1;
                 self.next_sample = self.bus.io.now + 64;
             }
         }
+        if (self.jit.is_some() || self.jitw.is_some()) && self.bus.watch.is_none() {
+            let blk = &mut self.bus.blk_arena[i];
+            if let Some(f) = blk.code {
+                self.run_compiled(f);
+                return;
+            }
+            blk.hits += 1;
+            if blk.hits >= crate::jit::HOT && !blk.no_jit {
+                let f = if self.jitw.is_some() { self.jit_async(pc, i) } else { self.compile_block(pc, i) };
+                if let Some(f) = f {
+                    self.run_compiled(f);
+                    return;
+                }
+            }
+        }
+        let blk: *const [crate::fast::Op] = &*self.bus.blk_arena[i].ops;
+        self.run_ops(pc, blk);
+    }
+
+    /// Run compiled code, then the compiled blocks that follow, for as long
+    /// as `run` would go straight from one to the next: no interrupt
+    /// pending, the clock below the limit and the next event, not stopped,
+    /// no fault, no cache flush pending, no profile being taken. (A block
+    /// never starts at a hooked PC, so there is no hook to check.)
+    #[inline(always)]
+    fn run_compiled(&mut self, mut f: crate::jit::BlockFn) {
+        loop {
+            self.jit_runs += 1;
+            // SAFETY: compiled for a block that is still cached (the cache
+            // only drops blocks in icache_settle, between blocks).
+            unsafe { f(self) };
+            let io = &self.bus.io;
+            if io.irq_level != 0
+                || io.now >= self.limit
+                || io.now >= io.deadline
+                || self.stopped
+                || self.last_fault.is_some()
+                || self.bus.flush_pending
+                || self.profile.is_some()
+            {
+                return;
+            }
+            match self.bus.block_at(self.pc).and_then(|j| self.bus.blk_arena[j].code) {
+                Some(g) => f = g,
+                None => return,
+            }
+        }
+    }
+
+    /// A hot block without code, with the compiler on its thread: send it
+    /// the first time, then take in whatever has been compiled. -> block
+    /// `i`'s code, if it has arrived.
+    #[cold]
+    fn jit_async(&mut self, pc: u32, i: usize) -> Option<crate::jit::BlockFn> {
+        let epoch = self.bus.icache_flushes;
+        if !self.bus.blk_arena[i].queued {
+            self.bus.blk_arena[i].queued = true;
+            let mut mem = crate::jit::Mem::of(&mut self.bus);
+            mem.macsr = self.macsr;
+            let w = self.jitw.as_ref()?;
+            w.queue(i, epoch, pc, &self.bus.blk_arena[i].ops, mem);
+            return None;
+        }
+        let w = self.jitw.as_ref()?;
+        for d in w.poll() {
+            if d.epoch == epoch && d.idx < self.bus.blk_arena.len() {
+                let b = &mut self.bus.blk_arena[d.idx];
+                b.code = d.f;
+                b.no_jit = d.f.is_none();
+            }
+        }
+        self.bus.blk_arena[i].code
+    }
+
+    /// Blocks compiled, declined, and seconds spent compiling.
+    pub fn jit_stats(&self) -> (u64, u64, f64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(w) = &self.jitw {
+            let s = &w.stats;
+            (s.compiled.load(Relaxed), s.failed.load(Relaxed), s.nanos.load(Relaxed) as f64 * 1e-9)
+        } else if let Some(j) = &self.jit {
+            (j.compiled, j.failed, j.compile_secs)
+        } else {
+            (0, 0, 0.0)
+        }
+    }
+
+    #[cold]
+    fn compile_block(&mut self, pc: u32, i: usize) -> Option<crate::jit::BlockFn> {
+        let jit = self.jit.as_mut()?;
+        if jit.epoch != self.bus.icache_flushes {
+            jit.reset(self.bus.icache_flushes);
+        }
+        let mut mem = crate::jit::Mem::of(&mut self.bus);
+        mem.macsr = self.macsr;
+        let blk = &mut self.bus.blk_arena[i];
+        let f = jit.compile(pc, &blk.ops, mem);
+        blk.code = f;
+        blk.no_jit = f.is_none();
+        f
+    }
+
+    /// `run_ops` for a block given as a slice (compiled code falling back).
+    pub(crate) fn run_ops_slice(&mut self, pc: u32, ops: &[crate::fast::Op]) {
+        self.run_ops(pc, ops as *const [crate::fast::Op]);
+    }
+
+    /// Run the predecoded block `blk`, which starts at `pc`. Stops early
+    /// when control leaves the straight line: a taken branch, an
+    /// exception, STOP.
+    #[inline(always)]
+    fn run_ops(&mut self, pc: u32, blk: *const [crate::fast::Op]) {
         // SAFETY: blocks are boxed and only dropped by `icache_settle`,
         // which runs between blocks, never while one executes.
         let ops: &[crate::fast::Op] = unsafe { &*blk };

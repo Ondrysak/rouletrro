@@ -24,6 +24,10 @@ fn main() {
     }
     let data: Vec<u8> = (0..DATA_LEN).map(pattern).collect();
     cpu.vbr = 0x4000_0000;
+    // CFDIFF_JIT: run each case as a compiled block (then the interpreter
+    // for whatever follows a block end).
+    let mut jit = std::env::var_os("CFDIFF_JIT").map(|_| dtemu::jit::Jit::new(0));
+    let mut cases = 0u64;
     let stdin = std::io::stdin();
     let mut out = std::io::BufWriter::new(std::io::stdout());
     for line in stdin.lock().lines() {
@@ -55,8 +59,32 @@ fn main() {
         cpu.pc = CODE;
         let end = CODE + code.len() as u32;
         let mut exc = None;
+        if let Some(j) = &mut jit {
+            cases += 1;
+            if cases.is_multiple_of(2000) {
+                j.reset(0);
+            }
+            let mut ops = Vec::new();
+            let mut p = CODE;
+            while p < end {
+                let o = dtemu::fast::decode(&cpu, p);
+                p = p.wrapping_add(o.len as u32);
+                let stop = o.end;
+                ops.push(o);
+                if stop {
+                    break;
+                }
+            }
+            let mem = dtemu::jit::Mem::of(&mut cpu.bus);
+            let f = j.compile(CODE, &ops, mem).expect("block compiles");
+            // SAFETY: compiled from `ops`, which outlive the call.
+            unsafe { f(&mut cpu) };
+            if (0x4000_0800..0x4000_0A00).contains(&cpu.pc) {
+                exc = Some((cpu.pc - 0x4000_0800) / 2);
+            }
+        }
         for _ in 0..64 {
-            if cpu.pc == end {
+            if cpu.pc == end || exc.is_some() {
                 break;
             }
             cpu.step();

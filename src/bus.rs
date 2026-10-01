@@ -45,14 +45,31 @@ pub struct Bus {
     /// The block cache over [CODE_BASE, CODE_BASE + span): halfword ->
     /// block id (0 = none), the blocks, and which halfwords hold code.
     blk_map: Vec<u32>,
-    blk_arena: Vec<Box<[Op]>>,
+    pub(crate) blk_arena: Vec<Block>,
     code_bits: Vec<u64>,
-    flush_pending: bool,
+    pub(crate) flush_pending: bool,
+    /// Compiled code's page tables (see `jit_pages`): per 64 KB of the
+    /// address space, the host address of plain memory there or 0, for
+    /// reads and for writes; and what they were built for.
+    jit_rd_pages: Vec<usize>,
+    jit_wr_pages: Vec<usize>,
+    jit_pages_for: (usize, usize, u32),
     pub icache_flushes: u64,
     icache_span: u32,
     pub icache_on: bool,
     pub icache_decodes: u64,
     pub icache_invalidations: u64,
+}
+
+/// A predecoded block, and its compiled code once it ran hot.
+pub struct Block {
+    pub ops: Box<[Op]>,
+    pub hits: u32,
+    pub code: Option<crate::jit::BlockFn>,
+    /// The compiler declined it; it stays interpreted.
+    pub no_jit: bool,
+    /// Sent to the background compiler.
+    pub queued: bool,
 }
 
 /// Where MAIN OS's text starts; the cache covers the image from here.
@@ -75,6 +92,9 @@ impl Bus {
             watch_log: Vec::new(),
             in_dma: false,
             blk_map: Vec::new(),
+            jit_rd_pages: Vec::new(),
+            jit_wr_pages: Vec::new(),
+            jit_pages_for: (0, 0, 0),
             blk_arena: Vec::new(),
             code_bits: Vec::new(),
             flush_pending: false,
@@ -122,9 +142,9 @@ impl Bus {
         }
     }
 
-    /// -> the block starting at `pc`, if one is built.
+    /// -> the index of the block starting at `pc`, if one is built.
     #[inline(always)]
-    pub fn block_at(&self, pc: u32) -> Option<*const [Op]> {
+    pub fn block_at(&self, pc: u32) -> Option<usize> {
         let o = pc.wrapping_sub(CODE_BASE);
         if o >= self.icache_span || o & 1 != 0 {
             return None;
@@ -133,7 +153,7 @@ impl Bus {
         if id == 0 {
             return None;
         }
-        Some(&*self.blk_arena[(id - 1) as usize] as *const [Op])
+        Some((id - 1) as usize)
     }
 
     /// DDR offset of `[a, a + len)` when all of it is plain DDR that no
@@ -154,15 +174,51 @@ impl Bus {
         Some(o)
     }
 
+    /// Page tables for compiled code: entry `a >> 16` is the host address
+    /// of the 64 KB page holding `a` when it is plain memory -- DDR (any
+    /// alias) or SRAM -- and 0 otherwise. The write table leaves out DDR
+    /// pages that overlap cached code, whose stores `check_code` must see.
+    /// An access through a non-zero entry that stays inside its page is
+    /// one `read*` / `write*` would make directly. Rebuilt when DDR or SRAM
+    /// move (a snapshot load) or the code window changes. -> (reads, writes)
+    pub fn jit_pages(&mut self) -> (*const usize, *const usize) {
+        let key = (self.ddr.as_ptr() as usize, self.sram.as_ptr() as usize, self.icache_span);
+        if self.jit_rd_pages.is_empty() || self.jit_pages_for != key {
+            let (lo, hi) = (CODE_BASE - 0x4000_0000, CODE_BASE - 0x4000_0000 + self.icache_span);
+            let mut rd = vec![0usize; 0x1_0000];
+            let mut wr = vec![0usize; 0x1_0000];
+            for page in 0..0x1_0000u32 {
+                let a = page << 16;
+                if let Some(o) = self.ddr_off(a) {
+                    if o + 0x1_0000 <= self.ddr.len() {
+                        let host = self.ddr.as_ptr() as usize + o;
+                        rd[page as usize] = host;
+                        let (s, e) = (o as u32, o as u32 + 0x1_0000);
+                        if self.icache_span == 0 || e <= lo || s >= hi {
+                            wr[page as usize] = host;
+                        }
+                    }
+                } else if Self::sram_off(a).is_some() {
+                    rd[page as usize] = self.sram.as_ptr() as usize;
+                    wr[page as usize] = self.sram.as_ptr() as usize;
+                }
+            }
+            self.jit_rd_pages = rd;
+            self.jit_wr_pages = wr;
+            self.jit_pages_for = key;
+        }
+        (self.jit_rd_pages.as_ptr(), self.jit_wr_pages.as_ptr())
+    }
+
     #[inline(always)]
     pub fn in_code_window(&self, pc: u32) -> bool {
         self.icache_on && pc.wrapping_sub(CODE_BASE) < self.icache_span && pc & 1 == 0
     }
 
     /// Record a block that starts at `pc` and covers [pc, end).
-    pub fn block_store(&mut self, pc: u32, end: u32, ops: Box<[Op]>) -> *const [Op] {
+    pub fn block_store(&mut self, pc: u32, end: u32, ops: Box<[Op]>) -> usize {
         let o = pc.wrapping_sub(CODE_BASE);
-        self.blk_arena.push(ops);
+        self.blk_arena.push(Block { ops, hits: 0, code: None, no_jit: false, queued: false });
         let id = self.blk_arena.len() as u32;
         self.blk_map[(o >> 1) as usize] = id;
         let e = end.wrapping_sub(CODE_BASE).min(self.icache_span);
@@ -171,7 +227,7 @@ impl Bus {
             self.code_bits[h >> 6] |= 1 << (h & 63);
         }
         self.icache_decodes += 1;
-        &**self.blk_arena.last().unwrap() as *const [Op]
+        self.blk_arena.len() - 1
     }
 
     /// A store to physical DDR offset `o`: if it lands on code some block

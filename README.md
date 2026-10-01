@@ -36,9 +36,7 @@ its path as the first argument to any of the tools.
 ```
 
 The first start boots from reset: splash screens, then, on a new card,
-the OS copies its factory project to the +Drive (about half a minute of
-emulated time; the CPU is fully busy, so a slow host runs it below real
-time). On exit (or with
+the OS copies its factory project to the +Drive (about half a minute). On exit (or with
 F5) the machine is saved to `--snapshot` and the card to `--card`; the next
 start resumes from the snapshot instantly.
 
@@ -57,7 +55,8 @@ Options:
 
 - `--ips N`: instructions per emulated second (default `200M`). The OS's
   audio render needs about 127M executed instructions per second of
-  audio. Lower values starve it.
+  audio. Lower values starve it. With the block compiler a 2.8 GHz Xeon
+  runs playback at about 150% of real time (the interpreter alone: 80%).
 - `--latency MS`: audio kept buffered ahead of the output (default 60).
   Raise it if a busy machine gives dropouts.
 - `--no-audio`: run without sound, paced by the wall clock.
@@ -127,6 +126,7 @@ Encoders: 0–7 are A–H, 8 is LEVEL/DATA.
 | `dtpeek` | inspect a snapshot: DMA descriptors, memory, LEDs, UART traffic, the frame buffer |
 | `dtcard` | format a card image, add samples, list and check the +Drive |
 | `cfdiff` | the CPU side of the differential tester below |
+| `jitcheck` | runs a snapshot (or a cold boot) on the interpreter and the block compiler side by side and compares the whole machine at every checkpoint |
 
 ## How it works
 
@@ -139,6 +139,18 @@ Encoders: 0–7 are A–H, 8 is LEVEL/DATA.
   instruction is decoded once into a handler with resolved operands; stores
   into cached code invalidate it. Anything not predecoded runs on the
   interpreter.
+- **`jit`**: a block compiler (Cranelift). A block that runs hot becomes
+  native code that leaves the machine exactly as the interpreter would,
+  bit for bit: guest registers, SR, MACSR and the accumulators live in
+  host registers within a block, condition codes are computed lazily, DDR
+  and SRAM accesses are inline, and a block that branches to itself loops
+  natively for as long as the interpreter would run it back to back.
+  Operations it does not translate are calls to their handlers. Blocks
+  compile on a background thread (a block runs interpreted until its code
+  arrives), so new code never stalls the audio, and compiled blocks run
+  one after another without returning to the run loop while nothing else
+  is due. About twice the interpreter's speed; `DTEMU_NO_JIT=1` turns it
+  off, `DTEMU_JIT_SYNC=1` compiles in line.
 - **`bus`**: 128 MB DDR (with aliases), 64 KB SRAM, sparse memory for
   everything else, and the peripheral models.
 - **`io`**, **`edma`**, **`esdhc`**, **`panel`**: the interrupt controllers,
@@ -164,15 +176,20 @@ card run on their own threads, fed through a ring buffer.
 cargo test --release              # unit tests, EMAC reference cases
 pip install unicorn capstone
 python3 tools/cfdiff.py 4000      # random instructions against Unicorn's M68K
+CFDIFF_JIT=1 python3 tools/cfdiff.py 4000   # the same through the block compiler
+./target/release/jitcheck snapshots/x.snap --instr 1G   # compiler vs interpreter
 ./target/release/fwinfo fw/Digitakt_OS1.53.syx -o sections   # extract, then:
 python3 tools/cfdis.py 40075e00 +100   # disassemble MAIN OS
 ```
 
 `cfdiff` runs random instruction sequences on both cores and compares
 registers and memory; it fails on any difference but the known one (MVZ,
-which clears N per the ColdFire manual where Unicorn sets it). CI runs the
-build, the tests, clippy and `cfdiff` on every push; none of it needs the
-firmware.
+which clears N per the ColdFire manual where Unicorn sets it). The block
+compiler is held to the interpreter by `jitcheck`: the machine is
+deterministic, so registers, clock, DDR, SRAM and every peripheral must
+match at each checkpoint. CI runs the build, the tests (including the
+randomized EMAC cases through the compiler), clippy and `cfdiff` both ways
+on every push; none of it needs the firmware.
 
 ## Status
 
