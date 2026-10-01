@@ -36,9 +36,7 @@ its path as the first argument to any of the tools.
 ```
 
 The first start boots from reset: splash screens, then, on a new card,
-the OS copies its factory project to the +Drive (about half a minute of
-emulated time; the CPU is fully busy, so a slow host runs it below real
-time). On exit (or with
+the OS copies its factory project to the +Drive (about half a minute). On exit (or with
 F5) the machine is saved to `--snapshot` and the card to `--card`; the next
 start resumes from the snapshot instantly.
 
@@ -57,7 +55,8 @@ Options:
 
 - `--ips N`: instructions per emulated second (default `200M`). The OS's
   audio render needs about 127M executed instructions per second of
-  audio. Lower values starve it.
+  audio. Lower values starve it. With the block compiler a 2.8 GHz Xeon
+  runs playback at about 150% of real time (the interpreter alone: 80%).
 - `--latency MS`: audio kept buffered ahead of the output (default 60).
   Raise it if a busy machine gives dropouts.
 - `--no-audio`: run without sound, paced by the wall clock.
@@ -148,9 +147,10 @@ Encoders: 0–7 are A–H, 8 is LEVEL/DATA.
   natively for as long as the interpreter would run it back to back.
   Operations it does not translate are calls to their handlers. Blocks
   compile on a background thread (a block runs interpreted until its code
-  arrives), so new code never stalls the audio. About 1.7 times the
-  interpreter's speed once warm; `DTEMU_NO_JIT=1` turns it off,
-  `DTEMU_JIT_SYNC=1` compiles in line.
+  arrives), so new code never stalls the audio, and compiled blocks run
+  one after another without returning to the run loop while nothing else
+  is due. About twice the interpreter's speed; `DTEMU_NO_JIT=1` turns it
+  off, `DTEMU_JIT_SYNC=1` compiles in line.
 - **`bus`**: 128 MB DDR (with aliases), 64 KB SRAM, sparse memory for
   everything else, and the peripheral models.
 - **`io`**, **`edma`**, **`esdhc`**, **`panel`**: the interrupt controllers,
