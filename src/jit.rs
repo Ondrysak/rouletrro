@@ -760,17 +760,26 @@ impl<'a> Tx<'a> {
         }
     }
 
+    /// `v` masked to `sz` bytes (nothing to do at 4).
+    fn masked(&mut self, v: Value, sz: u8) -> Value {
+        if sz == 4 {
+            v
+        } else {
+            self.b.ins().band_imm_u(v, mask(sz))
+        }
+    }
+
     /// A source operand masked to its size (`fast::read`, masking an
     /// immediate too, which the decoder already sized).
     fn get(&mut self, e: Ea, sz: u8) -> Value {
         match e {
             Ea::D(r) => {
                 let v = self.reg((r & 7) as usize);
-                self.b.ins().band_imm_u(v, mask(sz))
+                self.masked(v, sz)
             }
             Ea::A(r) => {
                 let v = self.reg(8 + (r & 7) as usize);
-                self.b.ins().band_imm_u(v, mask(sz))
+                self.masked(v, sz)
             }
             Ea::Imm(v) => self.k(v as i64 & mask(sz)),
             _ => {
@@ -847,6 +856,36 @@ impl<'a> Tx<'a> {
             _ => self.b.ins().icmp(IntCC::UnsignedGreaterThan, s, d),
         };
         self.bit(c, 0)
+    }
+
+    /// V as the pending op (or SR) has it, as an i8 truth value.
+    fn overflow(&mut self) -> Value {
+        match self.pend {
+            Pend::Add(sz) | Pend::Sub(sz, _) => {
+                let sub = matches!(self.pend, Pend::Sub(..));
+                let s = self.b.use_var(self.fs);
+                let d = self.b.use_var(self.fd);
+                let r = self.b.use_var(self.fr);
+                let v = if sub {
+                    let a = self.b.ins().bxor(s, d);
+                    let b2 = self.b.ins().bxor(r, d);
+                    self.b.ins().band(a, b2)
+                } else {
+                    let a = self.b.ins().bxor(s, r);
+                    let b2 = self.b.ins().bxor(d, r);
+                    self.b.ins().band(a, b2)
+                };
+                let v = self.b.ins().ushr_imm_u(v, bits(sz) - 1);
+                let v = self.b.ins().band_imm_u(v, 1);
+                self.b.ins().icmp_imm_u(IntCC::NotEqual, v, 0)
+            }
+            Pend::Logic(_) => self.b.ins().iconst(types::I8, 0),
+            Pend::None => {
+                let sr = self.sr();
+                let v = self.b.ins().band_imm_u(sr, CF_V);
+                self.b.ins().icmp_imm_u(IntCC::NotEqual, v, 0)
+            }
+        }
     }
 
     /// Work the pending op's condition codes into SR.
@@ -1093,7 +1132,7 @@ impl<'a> Tx<'a> {
                 let s = self.get(o.a, sz);
                 let dn = (o.r & 7) as usize;
                 let d = self.reg(dn);
-                let d = self.b.ins().band_imm_u(d, mask(sz));
+                let d = self.masked(d, sz);
                 let r = self.alu(op, s, d, sz, live);
                 if op != 5 {
                     self.put_dn(dn, sz, r);
@@ -1106,7 +1145,7 @@ impl<'a> Tx<'a> {
                     Ea::D(r) => {
                         let dn = (r & 7) as usize;
                         let d = self.reg(dn);
-                        let d = self.b.ins().band_imm_u(d, mask(sz));
+                        let d = self.masked(d, sz);
                         let r = self.alu(op, s, d, sz, need);
                         if op != 5 {
                             self.put_dn(dn, sz, r);
@@ -1151,7 +1190,7 @@ impl<'a> Tx<'a> {
             Kind::CmpiDn { sz } => {
                 let s = self.k(o.x as i64 & mask(sz));
                 let d = self.reg((o.r & 7) as usize);
-                let d = self.b.ins().band_imm_u(d, mask(sz));
+                let d = self.masked(d, sz);
                 self.arith(true, s, d, sz, true, lf);
             }
             Kind::Clr { sz } => {
@@ -1189,10 +1228,9 @@ impl<'a> Tx<'a> {
             Kind::Sats => {
                 let dn = (o.r & 7) as usize;
                 let d = self.reg(dn);
-                self.materialize();
-                let sr = self.sr();
-                let v = self.b.ins().band_imm_u(sr, CF_V);
-                let ovf = self.b.ins().icmp_imm_u(IntCC::NotEqual, v, 0);
+                // Only V is read; the rest of the pending codes die here
+                // (logic_flags keeps X if it is still live).
+                let ovf = self.overflow();
                 let neg = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, d, 0);
                 let mx = self.k(0x7FFF_FFFF);
                 let mn = self.k(0x8000_0000);
