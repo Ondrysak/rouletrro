@@ -45,7 +45,7 @@ pub struct Bus {
     /// The block cache over [CODE_BASE, CODE_BASE + span): halfword ->
     /// block id (0 = none), the blocks, and which halfwords hold code.
     blk_map: Vec<u32>,
-    blk_arena: Vec<Box<[Op]>>,
+    pub(crate) blk_arena: Vec<Block>,
     code_bits: Vec<u64>,
     flush_pending: bool,
     pub icache_flushes: u64,
@@ -53,6 +53,15 @@ pub struct Bus {
     pub icache_on: bool,
     pub icache_decodes: u64,
     pub icache_invalidations: u64,
+}
+
+/// A predecoded block, and its compiled code once it ran hot.
+pub struct Block {
+    pub ops: Box<[Op]>,
+    pub hits: u32,
+    pub code: Option<crate::jit::BlockFn>,
+    /// The compiler declined it; it stays interpreted.
+    pub no_jit: bool,
 }
 
 /// Where MAIN OS's text starts; the cache covers the image from here.
@@ -122,9 +131,9 @@ impl Bus {
         }
     }
 
-    /// -> the block starting at `pc`, if one is built.
+    /// -> the index of the block starting at `pc`, if one is built.
     #[inline(always)]
-    pub fn block_at(&self, pc: u32) -> Option<*const [Op]> {
+    pub fn block_at(&self, pc: u32) -> Option<usize> {
         let o = pc.wrapping_sub(CODE_BASE);
         if o >= self.icache_span || o & 1 != 0 {
             return None;
@@ -133,7 +142,7 @@ impl Bus {
         if id == 0 {
             return None;
         }
-        Some(&*self.blk_arena[(id - 1) as usize] as *const [Op])
+        Some((id - 1) as usize)
     }
 
     /// DDR offset of `[a, a + len)` when all of it is plain DDR that no
@@ -160,9 +169,9 @@ impl Bus {
     }
 
     /// Record a block that starts at `pc` and covers [pc, end).
-    pub fn block_store(&mut self, pc: u32, end: u32, ops: Box<[Op]>) -> *const [Op] {
+    pub fn block_store(&mut self, pc: u32, end: u32, ops: Box<[Op]>) -> usize {
         let o = pc.wrapping_sub(CODE_BASE);
-        self.blk_arena.push(ops);
+        self.blk_arena.push(Block { ops, hits: 0, code: None, no_jit: false });
         let id = self.blk_arena.len() as u32;
         self.blk_map[(o >> 1) as usize] = id;
         let e = end.wrapping_sub(CODE_BASE).min(self.icache_span);
@@ -171,7 +180,7 @@ impl Bus {
             self.code_bits[h >> 6] |= 1 << (h & 63);
         }
         self.icache_decodes += 1;
-        &**self.blk_arena.last().unwrap() as *const [Op]
+        self.blk_arena.len() - 1
     }
 
     /// A store to physical DDR offset `o`: if it lands on code some block

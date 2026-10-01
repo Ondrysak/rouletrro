@@ -14,6 +14,11 @@ serde-big-array = "0.5"
 minifb = { version = "0.27", default-features = false, features = ["x11"] }
 cpal = "0.15"
 png = "0.17"
+cranelift-codegen = "0.134"
+cranelift-frontend = "0.134"
+cranelift-jit = "0.134"
+cranelift-module = "0.134"
+cranelift-native = "0.134"
 
 [profile.release]
 debug = 1

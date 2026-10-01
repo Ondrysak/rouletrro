@@ -72,6 +72,10 @@ impl Machine {
             bus.icache_enable(os.data.len() as u32);
         }
         let mut cpu = Cpu::new(bus);
+        // The block compiler is opt-in while it is being built out.
+        if std::env::var_os("DTEMU_JIT").is_some() {
+            cpu.jit = Some(Box::new(crate::jit::Jit::new(cpu.bus.icache_flushes)));
+        }
         cpu.pc = prof.entry;
         cpu.sr = 0x2700;
         // The OS entry reads its argument at 4(a7).

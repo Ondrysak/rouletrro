@@ -13,7 +13,7 @@
 
 use crate::cpu::{Cpu, Loc, CF_C, CF_N, CF_V, CF_X, CF_Z};
 
-pub type Handler = fn(&mut Cpu, &Op);
+pub type Handler = extern "C" fn(&mut Cpu, &Op);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Ea {
@@ -46,32 +46,32 @@ pub struct Op {
 }
 
 /// Anything not predecoded: the reference interpreter, from the top.
-fn h_slow(c: &mut Cpu, _o: &Op) {
+extern "C" fn h_slow(c: &mut Cpu, _o: &Op) {
     c.pc = c.op_pc;
     c.execute();
 }
 
 /// A single-word instruction: the interpreter's dispatch without the fetch.
-fn h_word(c: &mut Cpu, o: &Op) {
+extern "C" fn h_word(c: &mut Cpu, o: &Op) {
     c.dispatch(o.op);
 }
 
 /// `h_word` with the line already chosen.
 fn h_word_line(op: u16) -> Handler {
-    fn l0(c: &mut Cpu, o: &Op) { c.line0(o.op) }
-    fn l1(c: &mut Cpu, o: &Op) { c.op_move(o.op, 1) }
-    fn l2(c: &mut Cpu, o: &Op) { c.op_move(o.op, 4) }
-    fn l3(c: &mut Cpu, o: &Op) { c.op_move(o.op, 2) }
-    fn l4(c: &mut Cpu, o: &Op) { c.line4(o.op) }
-    fn l5(c: &mut Cpu, o: &Op) { c.line5(o.op) }
-    fn l7(c: &mut Cpu, o: &Op) { c.line7(o.op) }
-    fn l8(c: &mut Cpu, o: &Op) { c.line8(o.op) }
-    fn l9(c: &mut Cpu, o: &Op) { c.line9d(o.op, false) }
-    fn la(c: &mut Cpu, o: &Op) { c.linea(o.op) }
-    fn lb(c: &mut Cpu, o: &Op) { c.lineb(o.op) }
-    fn lc(c: &mut Cpu, o: &Op) { c.linec(o.op) }
-    fn ld(c: &mut Cpu, o: &Op) { c.line9d(o.op, true) }
-    fn le(c: &mut Cpu, o: &Op) { c.linee(o.op) }
+    extern "C" fn l0(c: &mut Cpu, o: &Op) { c.line0(o.op) }
+    extern "C" fn l1(c: &mut Cpu, o: &Op) { c.op_move(o.op, 1) }
+    extern "C" fn l2(c: &mut Cpu, o: &Op) { c.op_move(o.op, 4) }
+    extern "C" fn l3(c: &mut Cpu, o: &Op) { c.op_move(o.op, 2) }
+    extern "C" fn l4(c: &mut Cpu, o: &Op) { c.line4(o.op) }
+    extern "C" fn l5(c: &mut Cpu, o: &Op) { c.line5(o.op) }
+    extern "C" fn l7(c: &mut Cpu, o: &Op) { c.line7(o.op) }
+    extern "C" fn l8(c: &mut Cpu, o: &Op) { c.line8(o.op) }
+    extern "C" fn l9(c: &mut Cpu, o: &Op) { c.line9d(o.op, false) }
+    extern "C" fn la(c: &mut Cpu, o: &Op) { c.linea(o.op) }
+    extern "C" fn lb(c: &mut Cpu, o: &Op) { c.lineb(o.op) }
+    extern "C" fn lc(c: &mut Cpu, o: &Op) { c.linec(o.op) }
+    extern "C" fn ld(c: &mut Cpu, o: &Op) { c.line9d(o.op, true) }
+    extern "C" fn le(c: &mut Cpu, o: &Op) { c.linee(o.op) }
     match op >> 12 {
         0x0 => l0,
         0x1 => l1,
@@ -94,7 +94,7 @@ fn h_word_line(op: u16) -> Handler {
 /// Register shifts. KIND: 0 left (ASL/LSL: ColdFire's ASL clears V like
 /// LSL), 1 LSR, 2 ASR. `r` is the data register, `x` the count, or with
 /// REG the count register.
-fn h_shift<const KIND: u8, const REG: bool>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_shift<const KIND: u8, const REG: bool>(c: &mut Cpu, o: &Op) {
     let count = if REG { c.d[o.x as usize] & 63 } else { o.x };
     let v = c.d[o.r as usize];
     let mut ccr = c.sr & !0x1F;
@@ -134,7 +134,7 @@ fn h_shift<const KIND: u8, const REG: bool>(c: &mut Cpu, o: &Op) {
 }
 
 /// ADDX.L / SUBX.L Dy,Dx: `r` = Dx, `x` = Dy.
-fn h_addx<const SUB: bool>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_addx<const SUB: bool>(c: &mut Cpu, o: &Op) {
     let x = c.sr & CF_X != 0;
     let z = c.sr & CF_Z;
     let (s, d) = (c.d[o.x as usize], c.d[o.r as usize]);
@@ -146,7 +146,7 @@ fn h_addx<const SUB: bool>(c: &mut Cpu, o: &Op) {
 }
 
 /// MOVE.L ACCy,Rx / MOVCLR.L: `r` = Rx as 0-15, `x` = y | clear << 8.
-fn h_movacc(c: &mut Cpu, o: &Op) {
+extern "C" fn h_movacc(c: &mut Cpu, o: &Op) {
     use crate::cpu::MACSR_PAV0;
     use crate::cpu::{MACSR_FI, MACSR_OMC, MACSR_RT, MACSR_SU};
     let i = (o.x & 3) as usize;
@@ -377,7 +377,7 @@ fn put<const K: u8, const SZ: u32>(c: &mut Cpu, e: Ea, v: u32) {
 }
 
 /// MOVE specialized on its operand kinds.
-fn h_mv<const SZ: u32, const S: u8, const D: u8>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mv<const SZ: u32, const S: u8, const D: u8>(c: &mut Cpu, o: &Op) {
     let v = get::<S, SZ>(c, o.a);
     put::<D, SZ>(c, o.b, v);
     c.set_nz(v, SZ);
@@ -450,71 +450,71 @@ fn move_handler(sz: u32, a: Ea, b: Ea) -> Handler {
     }
 }
 
-fn h_movea<const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_movea<const SZ: u32>(c: &mut Cpu, o: &Op) {
     let v = read(c, o.a, SZ);
     c.a[o.r as usize] = sext(v, SZ);
 }
 
-fn h_mvs<const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mvs<const SZ: u32>(c: &mut Cpu, o: &Op) {
     let v = sext(read(c, o.a, SZ), SZ);
     c.d[o.r as usize] = v;
     c.set_nz(v, 4);
 }
 
-fn h_mvz<const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mvz<const SZ: u32>(c: &mut Cpu, o: &Op) {
     let v = read(c, o.a, SZ);
     c.d[o.r as usize] = v;
     c.set_nz(v, 4);
 }
 
-fn h_moveq(c: &mut Cpu, o: &Op) {
+extern "C" fn h_moveq(c: &mut Cpu, o: &Op) {
     c.d[o.r as usize] = o.x;
     c.set_nz(o.x, 4);
 }
 
-fn h_mov3q(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mov3q(c: &mut Cpu, o: &Op) {
     let l = loc(c, o.b, 4);
     c.write_loc(l, 4, o.x);
     c.set_nz(o.x, 4);
 }
 
-fn h_lea(c: &mut Cpu, o: &Op) {
+extern "C" fn h_lea(c: &mut Cpu, o: &Op) {
     c.a[o.r as usize] = addr_of(c, o.a);
 }
 
-fn h_pea(c: &mut Cpu, o: &Op) {
+extern "C" fn h_pea(c: &mut Cpu, o: &Op) {
     let a = addr_of(c, o.a);
     c.push32(a);
 }
 
-fn h_jsr(c: &mut Cpu, o: &Op) {
+extern "C" fn h_jsr(c: &mut Cpu, o: &Op) {
     let t = addr_of(c, o.a);
     let ret = c.pc;
     c.push32(ret);
     c.pc = t;
 }
 
-fn h_jmp(c: &mut Cpu, o: &Op) {
+extern "C" fn h_jmp(c: &mut Cpu, o: &Op) {
     c.pc = addr_of(c, o.a);
 }
 
-fn h_bra(c: &mut Cpu, o: &Op) {
+extern "C" fn h_bra(c: &mut Cpu, o: &Op) {
     c.pc = o.x;
 }
 
-fn h_bsr(c: &mut Cpu, o: &Op) {
+extern "C" fn h_bsr(c: &mut Cpu, o: &Op) {
     let ret = c.pc;
     c.push32(ret);
     c.pc = o.x;
 }
 
-fn h_bcc(c: &mut Cpu, o: &Op) {
+extern "C" fn h_bcc(c: &mut Cpu, o: &Op) {
     if c.cond(o.r as u16) {
         c.pc = o.x;
     }
 }
 
-fn h_link(c: &mut Cpu, o: &Op) {
+extern "C" fn h_link(c: &mut Cpu, o: &Op) {
     let r = o.r as usize;
     let v = c.a[r];
     c.push32(v);
@@ -522,18 +522,18 @@ fn h_link(c: &mut Cpu, o: &Op) {
     c.a[7] = c.a[7].wrapping_add(o.x);
 }
 
-fn h_clr<const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_clr<const SZ: u32>(c: &mut Cpu, o: &Op) {
     let l = loc(c, o.b, SZ);
     c.write_loc(l, SZ, 0);
     c.sr = (c.sr & !0x0F) | CF_Z;
 }
 
-fn h_tst<const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_tst<const SZ: u32>(c: &mut Cpu, o: &Op) {
     let v = read(c, o.a, SZ);
     c.set_nz(v, SZ);
 }
 
-fn h_movem(c: &mut Cpu, o: &Op) {
+extern "C" fn h_movem(c: &mut Cpu, o: &Op) {
     let mut a = addr_of(c, o.a);
     let m = o.x as u16;
     let to_mem = o.r != 0;
@@ -580,7 +580,7 @@ fn h_movem(c: &mut Cpu, o: &Op) {
 /// engine's resampler and mixer. LM is the load's addressing mode (0 none,
 /// 2 (An), 3 (An)+, 4 -(An), 5 (d16,An)); LONG takes 32-bit operands.
 /// Anything else at run time goes to `h_mac`.
-fn h_mac_f<const LM: u8, const LONG: bool>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mac_f<const LM: u8, const LONG: bool>(c: &mut Cpu, o: &Op) {
     use crate::cpu::{MACSR_FI, MACSR_OMC, MACSR_PAV0, MACSR_RT, MACSR_SU, MACSR_V};
     let m = c.macsr;
     if m & (MACSR_RT | MACSR_SU | MACSR_FI) != MACSR_FI {
@@ -666,7 +666,7 @@ fn h_mac_f<const LM: u8, const LONG: bool>(c: &mut Cpu, o: &Op) {
 /// The two modes the audio engine runs in -- signed fractional and signed
 /// integer, with or without OMC, no rounding -- are computed inline; the
 /// rest go to the general `mac_core`.
-fn h_mac(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mac(c: &mut Cpu, o: &Op) {
     use crate::cpu::{MACSR_FI, MACSR_OMC, MACSR_PAV0, MACSR_RT, MACSR_SU, MACSR_V};
     let m = c.macsr;
     let fast_mode = m & (MACSR_RT | MACSR_SU) == 0;
@@ -821,7 +821,7 @@ fn alu(c: &mut Cpu, op: u8, s: u32, d: u32, sz: u32) -> u32 {
 }
 
 /// <ea>,Dn, specialized on the source kind K.
-fn h_alu_ea_dn<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_alu_ea_dn<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
     let s = get::<K, SZ>(c, o.a);
     let dn = o.r as usize;
     let r = alu(c, OP, s, c.d[dn], SZ);
@@ -832,7 +832,7 @@ fn h_alu_ea_dn<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
 }
 
 /// Dn,<ea>
-fn h_alu_dn_ea<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_alu_dn_ea<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
     let l = loc(c, o.b, SZ);
     let d = c.read_loc(l, SZ);
     let s = c.d[o.r as usize];
@@ -842,7 +842,7 @@ fn h_alu_dn_ea<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
 
 /// #imm,<ea> (ADDI/SUBI/ANDI/ORI/EORI/CMPI on Dn, ADDQ/SUBQ on any). K is
 /// K_D for a data register destination, K_ANY otherwise.
-fn h_alu_imm<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_alu_imm<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
     if K == K_D {
         let dn = (o.r & 7) as usize;
         let r = alu(c, OP, o.x, c.d[dn] & mask(SZ), SZ);
@@ -860,7 +860,7 @@ fn h_alu_imm<const OP: u8, const SZ: u32, const K: u8>(c: &mut Cpu, o: &Op) {
 }
 
 /// ADDA/SUBA/CMPA <ea>,An. OP: 0 add, 1 sub, 5 cmp.
-fn h_alu_an<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_alu_an<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
     let s = sext(read(c, o.a, SZ), SZ);
     let an = o.r as usize;
     match OP {
@@ -873,12 +873,12 @@ fn h_alu_an<const OP: u8, const SZ: u32>(c: &mut Cpu, o: &Op) {
     }
 }
 
-fn h_quick_an(c: &mut Cpu, o: &Op) {
+extern "C" fn h_quick_an(c: &mut Cpu, o: &Op) {
     let r = o.r as usize;
     c.a[r] = c.a[r].wrapping_add(o.x);
 }
 
-fn h_mul_w<const SIGNED: bool>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mul_w<const SIGNED: bool>(c: &mut Cpu, o: &Op) {
     let s = read(c, o.a, 2);
     let dn = o.r as usize;
     let r = if SIGNED {
@@ -890,7 +890,7 @@ fn h_mul_w<const SIGNED: bool>(c: &mut Cpu, o: &Op) {
     c.set_nz(r, 4);
 }
 
-fn h_mul_l(c: &mut Cpu, o: &Op) {
+extern "C" fn h_mul_l(c: &mut Cpu, o: &Op) {
     let s = read(c, o.a, 4);
     let dl = o.r as usize;
     let r = if o.x & 0x0800 != 0 {
@@ -902,7 +902,7 @@ fn h_mul_l(c: &mut Cpu, o: &Op) {
     c.set_nz(r, 4);
 }
 
-fn h_cmpi_dn<const SZ: u32>(c: &mut Cpu, o: &Op) {
+extern "C" fn h_cmpi_dn<const SZ: u32>(c: &mut Cpu, o: &Op) {
     let d = c.d[o.r as usize];
     c.cmp_flags(o.x, d, SZ);
 }
@@ -1001,7 +1001,7 @@ pub fn decode(c: &Cpu, pc: u32) -> Op {
 }
 
 /// Decode a basic block at `pc` and store it. -> the block.
-pub fn build_block(c: &mut Cpu, pc: u32) -> *const [Op] {
+pub fn build_block(c: &mut Cpu, pc: u32) -> usize {
     let mut ops = Vec::with_capacity(8);
     let mut p = pc;
     loop {
