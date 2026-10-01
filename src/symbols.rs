@@ -56,10 +56,16 @@ impl Pat {
     /// -> the image offsets (word aligned) where it matches.
     fn find(&self, img: &[u8]) -> Vec<usize> {
         let p = &self.0;
-        let first = p[0].expect("pattern starts with a byte");
-        (0..img.len().saturating_sub(p.len()))
-            .step_by(2)
-            .filter(|&o| img[o] == first && p.iter().zip(&img[o..]).all(|(q, &b)| q.is_none_or(|q| q == b)))
+        let first = [p[0].expect("pattern starts with a byte"), p[1].unwrap_or(0)];
+        let any2 = p[1].is_none();
+        let end = img.len().saturating_sub(p.len());
+        // A quick scan for the first word, then the whole pattern.
+        img[..end]
+            .chunks_exact(2)
+            .enumerate()
+            .filter(|(_, w)| w[0] == first[0] && (any2 || w[1] == first[1]))
+            .map(|(i, _)| 2 * i)
+            .filter(|&o| p.iter().zip(&img[o..]).all(|(q, &b)| q.is_none_or(|q| q == b)))
             .collect()
     }
 }
