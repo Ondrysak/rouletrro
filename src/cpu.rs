@@ -594,24 +594,50 @@ impl Cpu {
         if (self.jit.is_some() || self.jitw.is_some()) && self.bus.watch.is_none() {
             let blk = &mut self.bus.blk_arena[i];
             if let Some(f) = blk.code {
-                self.jit_runs += 1;
-                // SAFETY: compiled for this block, which is still cached.
-                unsafe { f(self) };
+                self.run_compiled(f);
                 return;
             }
             blk.hits += 1;
             if blk.hits >= crate::jit::HOT && !blk.no_jit {
                 let f = if self.jitw.is_some() { self.jit_async(pc, i) } else { self.compile_block(pc, i) };
                 if let Some(f) = f {
-                    self.jit_runs += 1;
-                    // SAFETY: as above.
-                    unsafe { f(self) };
+                    self.run_compiled(f);
                     return;
                 }
             }
         }
         let blk: *const [crate::fast::Op] = &*self.bus.blk_arena[i].ops;
         self.run_ops(pc, blk);
+    }
+
+    /// Run compiled code, then the compiled blocks that follow, for as long
+    /// as `run` would go straight from one to the next: no interrupt
+    /// pending, the clock below the limit and the next event, not stopped,
+    /// no fault, no cache flush pending, no profile being taken. (A block
+    /// never starts at a hooked PC, so there is no hook to check.)
+    #[inline(always)]
+    fn run_compiled(&mut self, mut f: crate::jit::BlockFn) {
+        loop {
+            self.jit_runs += 1;
+            // SAFETY: compiled for a block that is still cached (the cache
+            // only drops blocks in icache_settle, between blocks).
+            unsafe { f(self) };
+            let io = &self.bus.io;
+            if io.irq_level != 0
+                || io.now >= self.limit
+                || io.now >= io.deadline
+                || self.stopped
+                || self.last_fault.is_some()
+                || self.bus.flush_pending
+                || self.profile.is_some()
+            {
+                return;
+            }
+            match self.bus.block_at(self.pc).and_then(|j| self.bus.blk_arena[j].code) {
+                Some(g) => f = g,
+                None => return,
+            }
+        }
     }
 
     /// A hot block without code, with the compiler on its thread: send it
