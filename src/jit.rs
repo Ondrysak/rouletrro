@@ -94,17 +94,12 @@ extern "C" fn jit_mac_read(c: &mut Cpu, i: u32, _: u32) -> u32 {
     c.mac_read(i as usize)
 }
 
-/// Where DDR is, for inline accesses.
+/// What compiled code needs from the machine: the page tables for inline
+/// memory accesses (`Bus::jit_pages`).
 #[derive(Clone, Copy)]
 pub struct Mem {
-    pub base: *mut u8,
-    pub mask: u32,
-    pub len: u32,
-    /// The cached code window, as DDR offsets [lo, lo + span).
-    pub code_lo: u32,
-    pub code_span: u32,
-    /// SRAM: 64 KB, aliased through 0x80000000-0x8BFFFFFF.
-    pub sram: *mut u8,
+    pub rd_pages: *const usize,
+    pub wr_pages: *const usize,
     /// MACSR when the block is compiled: EMAC blocks are specialized on
     /// its OMC bit (and check it on entry).
     pub macsr: u32,
@@ -112,8 +107,8 @@ pub struct Mem {
 
 impl Mem {
     pub fn of(bus: &mut crate::bus::Bus) -> Mem {
-        let (base, mask, len, code_lo, code_span, sram) = bus.jit_mem();
-        Mem { base, mask, len, code_lo, code_span, sram, macsr: 0 }
+        let (rd_pages, wr_pages) = bus.jit_pages();
+        Mem { rd_pages, wr_pages, macsr: 0 }
     }
 }
 
@@ -611,36 +606,21 @@ impl<'a> Tx<'a> {
 
     // -- memory ---------------------------------------------------------------
 
-    /// Is `addr` an inline DDR access of `sz` bytes? (`write`: and not one
-    /// `check_code` must see.) -> (condition, DDR offset)
-    fn ddr_test(&mut self, addr: Value, sz: u8, write: bool) -> (Value, Value) {
-        let hi = self.b.ins().band_imm_u(addr, 0xC000_0000u32 as i64);
-        let is_ddr = self.b.ins().icmp_imm_u(IntCC::Equal, hi, 0x4000_0000);
-        let off = self.b.ins().band_imm_u(addr, self.mem.mask as i64);
-        let fits = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, off, (self.mem.len - sz as u32) as i64);
-        let mut ok = self.b.ins().band(is_ddr, fits);
-        if write && self.mem.code_span != 0 {
-            let rel = self.b.ins().iadd_imm_s(off, -(self.mem.code_lo as i64));
-            let outside = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, rel, self.mem.code_span as i64);
-            ok = self.b.ins().band(ok, outside);
-        }
-        (ok, off)
-    }
-
-    fn host_addr(&mut self, base: *mut u8, off: Value) -> Value {
+    /// The host address for an inline access of `sz` bytes at `addr`
+    /// through page table `table`. -> (condition, host address)
+    fn page(&mut self, table: *const usize, addr: Value, sz: u8) -> (Value, Value) {
+        let pg = self.b.ins().ushr_imm_u(addr, 16);
+        let pg = self.b.ins().uextend(self.ptr, pg);
+        let pg = self.b.ins().ishl_imm_u(pg, 3);
+        let t = self.b.ins().iconst(self.ptr, table as usize as i64);
+        let e = self.b.ins().iadd(t, pg);
+        let host = self.b.ins().load(self.ptr, mf(), e, 0);
+        let off = self.b.ins().band_imm_u(addr, 0xFFFF);
+        let mapped = self.b.ins().icmp_imm_u(IntCC::NotEqual, host, 0);
+        let inside = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, off, 0x1_0000 - sz as i64);
+        let ok = self.b.ins().band(mapped, inside);
         let off = self.b.ins().uextend(self.ptr, off);
-        let base = self.b.ins().iconst(self.ptr, base as usize as i64);
-        self.b.ins().iadd(base, off)
-    }
-
-    /// Is `addr` an SRAM access of `sz` bytes (as `Bus::sram_off` with the
-    /// fit check)? -> (condition, SRAM offset)
-    fn sram_test(&mut self, addr: Value, sz: u8) -> (Value, Value) {
-        let rel = self.b.ins().iadd_imm_s(addr, -(crate::bus::SRAM_BASE as i64));
-        let inside = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, rel, 0x0C00_0000);
-        let off = self.b.ins().band_imm_u(addr, (crate::bus::SRAM_SIZE - 1) as i64);
-        let fits = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, off, (crate::bus::SRAM_SIZE - sz as usize) as i64);
-        (self.b.ins().band(inside, fits), off)
+        (ok, self.b.ins().iadd(host, off))
     }
 
     fn load_be(&mut self, p: Value, sz: u8) -> Value {
@@ -677,28 +657,17 @@ impl<'a> Tx<'a> {
         }
     }
 
-    /// A read as `Bus::read*` does it: DDR, then SRAM, then the slow path.
+    /// A read as `Bus::read*` makes it: plain memory inline, the rest
+    /// through the bus.
     fn read(&mut self, addr: Value, sz: u8) -> Value {
-        let (ok, off) = self.ddr_test(addr, sz, false);
-        let ddr = self.b.create_block();
-        let not_ddr = self.b.create_block();
-        let sram = self.b.create_block();
+        let (ok, p) = self.page(self.mem.rd_pages, addr, sz);
+        let fast = self.b.create_block();
         let slow = self.b.create_block();
         let join = self.b.create_block();
         self.b.append_block_param(join, types::I32);
-        self.b.ins().brif(ok, ddr, &[], not_ddr, &[]);
+        self.b.ins().brif(ok, fast, &[], slow, &[]);
 
-        self.b.switch_to_block(ddr);
-        let p = self.host_addr(self.mem.base, off);
-        let v = self.load_be(p, sz);
-        self.b.ins().jump(join, &[v.into()]);
-
-        self.b.switch_to_block(not_ddr);
-        let (ok, soff) = self.sram_test(addr, sz);
-        self.b.ins().brif(ok, sram, &[], slow, &[]);
-
-        self.b.switch_to_block(sram);
-        let p = self.host_addr(self.mem.sram, soff);
+        self.b.switch_to_block(fast);
         let v = self.load_be(p, sz);
         self.b.ins().jump(join, &[v.into()]);
 
@@ -716,28 +685,16 @@ impl<'a> Tx<'a> {
         self.b.block_params(join)[0]
     }
 
-    /// A write as `Bus::write*` does it (DDR stores into cached code take
-    /// the slow path, which tells the block cache).
+    /// A write as `Bus::write*` makes it (stores near cached code go
+    /// through the bus, which tells the block cache).
     fn write(&mut self, addr: Value, sz: u8, v: Value) {
-        let (ok, off) = self.ddr_test(addr, sz, true);
-        let ddr = self.b.create_block();
-        let not_ddr = self.b.create_block();
-        let sram = self.b.create_block();
+        let (ok, p) = self.page(self.mem.wr_pages, addr, sz);
+        let fast = self.b.create_block();
         let slow = self.b.create_block();
         let join = self.b.create_block();
-        self.b.ins().brif(ok, ddr, &[], not_ddr, &[]);
+        self.b.ins().brif(ok, fast, &[], slow, &[]);
 
-        self.b.switch_to_block(ddr);
-        let p = self.host_addr(self.mem.base, off);
-        self.store_be(p, sz, v);
-        self.b.ins().jump(join, &[]);
-
-        self.b.switch_to_block(not_ddr);
-        let (ok, soff) = self.sram_test(addr, sz);
-        self.b.ins().brif(ok, sram, &[], slow, &[]);
-
-        self.b.switch_to_block(sram);
-        let p = self.host_addr(self.mem.sram, soff);
+        self.b.switch_to_block(fast);
         self.store_be(p, sz, v);
         self.b.ins().jump(join, &[]);
 

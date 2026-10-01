@@ -48,6 +48,12 @@ pub struct Bus {
     pub(crate) blk_arena: Vec<Block>,
     code_bits: Vec<u64>,
     pub(crate) flush_pending: bool,
+    /// Compiled code's page tables (see `jit_pages`): per 64 KB of the
+    /// address space, the host address of plain memory there or 0, for
+    /// reads and for writes; and what they were built for.
+    jit_rd_pages: Vec<usize>,
+    jit_wr_pages: Vec<usize>,
+    jit_pages_for: (usize, usize, u32),
     pub icache_flushes: u64,
     icache_span: u32,
     pub icache_on: bool,
@@ -86,6 +92,9 @@ impl Bus {
             watch_log: Vec::new(),
             in_dma: false,
             blk_map: Vec::new(),
+            jit_rd_pages: Vec::new(),
+            jit_wr_pages: Vec::new(),
+            jit_pages_for: (0, 0, 0),
             blk_arena: Vec::new(),
             code_bits: Vec::new(),
             flush_pending: false,
@@ -165,12 +174,40 @@ impl Bus {
         Some(o)
     }
 
-    /// What compiled code needs to reach DDR directly: its base, the
-    /// address mask, its length, and the cached code window as DDR offsets
-    /// (a store starting there must go through `write*` for `check_code`).
-    pub fn jit_mem(&mut self) -> (*mut u8, u32, u32, u32, u32, *mut u8) {
-        let lo = CODE_BASE - 0x4000_0000;
-        (self.ddr.as_mut_ptr(), self.ddr_mask, self.ddr.len() as u32, lo, self.icache_span, self.sram.as_mut_ptr())
+    /// Page tables for compiled code: entry `a >> 16` is the host address
+    /// of the 64 KB page holding `a` when it is plain memory -- DDR (any
+    /// alias) or SRAM -- and 0 otherwise. The write table leaves out DDR
+    /// pages that overlap cached code, whose stores `check_code` must see.
+    /// An access through a non-zero entry that stays inside its page is
+    /// one `read*` / `write*` would make directly. Rebuilt when DDR or SRAM
+    /// move (a snapshot load) or the code window changes. -> (reads, writes)
+    pub fn jit_pages(&mut self) -> (*const usize, *const usize) {
+        let key = (self.ddr.as_ptr() as usize, self.sram.as_ptr() as usize, self.icache_span);
+        if self.jit_rd_pages.is_empty() || self.jit_pages_for != key {
+            let (lo, hi) = (CODE_BASE - 0x4000_0000, CODE_BASE - 0x4000_0000 + self.icache_span);
+            let mut rd = vec![0usize; 0x1_0000];
+            let mut wr = vec![0usize; 0x1_0000];
+            for page in 0..0x1_0000u32 {
+                let a = page << 16;
+                if let Some(o) = self.ddr_off(a) {
+                    if o + 0x1_0000 <= self.ddr.len() {
+                        let host = self.ddr.as_ptr() as usize + o;
+                        rd[page as usize] = host;
+                        let (s, e) = (o as u32, o as u32 + 0x1_0000);
+                        if self.icache_span == 0 || e <= lo || s >= hi {
+                            wr[page as usize] = host;
+                        }
+                    }
+                } else if Self::sram_off(a).is_some() {
+                    rd[page as usize] = self.sram.as_ptr() as usize;
+                    wr[page as usize] = self.sram.as_ptr() as usize;
+                }
+            }
+            self.jit_rd_pages = rd;
+            self.jit_wr_pages = wr;
+            self.jit_pages_for = key;
+        }
+        (self.jit_rd_pages.as_ptr(), self.jit_wr_pages.as_ptr())
     }
 
     #[inline(always)]
