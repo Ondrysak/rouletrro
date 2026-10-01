@@ -31,9 +31,132 @@ pub enum Ea {
     Imm(u32),
 }
 
+/// What an op is, for the block compiler (`jit`), which translates the
+/// common ones itself; `Call` runs the handler. Sizes are in bytes; ALU
+/// operations number as `alu` does (0 add, 1 sub, 2 and, 3 or, 4 eor,
+/// 5 cmp).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Kind {
+    Call,
+    /// MOVE a -> b.
+    Move { sz: u8 },
+    /// MOVEA a -> A(r).
+    MoveA { sz: u8 },
+    /// MOVEQ #x -> D(r).
+    MoveQ,
+    /// MVS / MVZ a -> D(r).
+    Mvs { sz: u8 },
+    Mvz { sz: u8 },
+    /// LEA a -> A(r).
+    Lea,
+    /// <a> op D(r) -> D(r).
+    AluEaDn { op: u8, sz: u8 },
+    /// #x op <b> -> <b> (ADDI.. on Dn, ADDQ/SUBQ on any).
+    AluImm { op: u8, sz: u8 },
+    /// ADDA/SUBA/CMPA a, A(r).
+    AluAn { op: u8, sz: u8 },
+    /// ADDQ/SUBQ to A(r): add x.
+    QuickAn,
+    /// CMPI #x, D(r).
+    CmpiDn { sz: u8 },
+    /// Bcc (condition r) / BRA to x.
+    Bcc,
+    Bra,
+    Clr { sz: u8 },
+    Tst { sz: u8 },
+    /// Register shift: kind 0 left, 1 LSR, 2 ASR; count x or D(x).
+    Shift { kind: u8, reg: bool },
+    /// ADDX/SUBX.L D(x), D(r).
+    Addx { sub: bool },
+    /// MAC/MSAC (`h_mac_f`): load mode lm (0 none, 2-5 the EA mode),
+    /// long operands; `x` as `h_mac` packs it, displacement in `a`.
+    Mac { lm: u8, long: bool },
+    /// MOVE.L ACC(x & 3), R(r) (0-15), clearing it if x & 0x100.
+    MovAcc,
+    /// SATS.L D(r).
+    Sats,
+    /// SWAP D(r).
+    Swap,
+}
+
+/// The kind of a natively decoded op (see `Kind`).
+fn classify(o: &Op) -> Kind {
+    let op = o.op;
+    let opmode = (op >> 6) & 7;
+    match op >> 12 {
+        0x1..=0x3 => {
+            let sz = [0, 1, 4, 2][(op >> 12) as usize];
+            if opmode == 1 { Kind::MoveA { sz } } else { Kind::Move { sz } }
+        }
+        0x6 => match (op >> 8) & 15 {
+            0 => Kind::Bra,
+            1 => Kind::Call,
+            _ => Kind::Bcc,
+        },
+        0x0 => match op & 0xFFF8 {
+            0x0080 => Kind::AluImm { op: 3, sz: 4 },
+            0x0280 => Kind::AluImm { op: 2, sz: 4 },
+            0x0480 => Kind::AluImm { op: 1, sz: 4 },
+            0x0680 => Kind::AluImm { op: 0, sz: 4 },
+            0x0A80 => Kind::AluImm { op: 4, sz: 4 },
+            0x0C00 => Kind::CmpiDn { sz: 1 },
+            0x0C40 => Kind::CmpiDn { sz: 2 },
+            0x0C80 => Kind::CmpiDn { sz: 4 },
+            _ => Kind::Call,
+        },
+        0x4 => {
+            let ss = (op >> 6) & 3;
+            if op & 0x01C0 == 0x01C0 && op & 0xFFF8 != 0x49C0 {
+                Kind::Lea
+            } else if op & 0xFF00 == 0x4200 && ss != 3 {
+                Kind::Clr { sz: szf(ss) as u8 }
+            } else if op & 0xFF00 == 0x4A00 && ss != 3 {
+                Kind::Tst { sz: szf(ss) as u8 }
+            } else {
+                Kind::Call
+            }
+        }
+        0x5 => {
+            if (op >> 3) & 7 == 1 {
+                Kind::QuickAn
+            } else {
+                Kind::AluImm { op: ((op >> 8) & 1) as u8, sz: szf((op >> 6) & 3) as u8 }
+            }
+        }
+        0x7 => {
+            if op & 0x100 == 0 {
+                Kind::MoveQ
+            } else {
+                let sz = if (op >> 6) & 1 == 0 { 1 } else { 2 };
+                if (op >> 7) & 1 == 0 { Kind::Mvs { sz } } else { Kind::Mvz { sz } }
+            }
+        }
+        0xA if op & 0x0100 == 0 => {
+            let load = op & 0x30 != 0;
+            Kind::Mac { lm: if load { ((op >> 3) & 7) as u8 } else { 0 }, long: o.x & 0x0800 != 0 }
+        }
+        0x8 | 0x9 | 0xB | 0xC | 0xD => {
+            let alu = match op >> 12 {
+                0xD => 0,
+                0x9 => 1,
+                0xC => 2,
+                0x8 => 3,
+                _ => 5,
+            };
+            match opmode {
+                3 | 7 if matches!(op >> 12, 0x9 | 0xB | 0xD) => Kind::AluAn { op: alu, sz: if opmode == 3 { 2 } else { 4 } },
+                0..=2 if !(op >> 12 == 0xC && opmode == 3) => Kind::AluEaDn { op: alu, sz: szf(opmode) as u8 },
+                _ => Kind::Call,
+            }
+        }
+        _ => Kind::Call,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Op {
     pub h: Handler,
+    pub k: Kind,
     /// Length in bytes; the handler runs with PC already past it.
     pub len: u8,
     /// Ends its block: control flow, an SR write, or an interpreter fallback.
@@ -176,6 +299,14 @@ extern "C" fn h_movacc(c: &mut Cpu, o: &Op) {
 /// A single-word instruction with a native handler, if it has one.
 fn word_native(op: u16) -> Option<Op> {
     let r = (op & 7) as u8;
+    if matches!(op & 0xFFF8, 0x4C80 | 0x4840) {
+        // SATS / SWAP: the interpreter runs them; the block compiler
+        // translates them.
+        let mut o = mk(h_word_line(op));
+        o.r = r;
+        o.k = if op & 0xFFF8 == 0x4C80 { Kind::Sats } else { Kind::Swap };
+        return Some(o);
+    }
     match op >> 12 {
         0xE if (op >> 6) & 3 == 2 && (op >> 3) & 3 <= 1 => {
             let left = op & 0x100 != 0;
@@ -192,18 +323,21 @@ fn word_native(op: u16) -> Option<Op> {
             });
             o.r = r;
             o.x = if reg { f } else if f == 0 { 8 } else { f };
+            o.k = Kind::Shift { kind, reg };
             Some(o)
         }
         0x9 | 0xD if op & 0x01F8 == 0x0180 => {
             let mut o = mk(if op >> 12 == 0x9 { h_addx::<true> } else { h_addx::<false> });
             o.r = ((op >> 9) & 7) as u8;
             o.x = r as u32;
+            o.k = Kind::Addx { sub: op >> 12 == 0x9 };
             Some(o)
         }
         0xA if op & 0xF9B0 == 0xA180 => {
             let mut o = mk(h_movacc);
             o.r = (op & 0xF) as u8;
             o.x = ((op >> 9) & 3) as u32 | if op & 0x40 != 0 { 0x100 } else { 0 };
+            o.k = Kind::MovAcc;
             Some(o)
         }
         _ => None,
@@ -666,7 +800,7 @@ extern "C" fn h_mac_f<const LM: u8, const LONG: bool>(c: &mut Cpu, o: &Op) {
 /// The two modes the audio engine runs in -- signed fractional and signed
 /// integer, with or without OMC, no rounding -- are computed inline; the
 /// rest go to the general `mac_core`.
-extern "C" fn h_mac(c: &mut Cpu, o: &Op) {
+pub extern "C" fn h_mac(c: &mut Cpu, o: &Op) {
     use crate::cpu::{MACSR_FI, MACSR_OMC, MACSR_PAV0, MACSR_RT, MACSR_SU, MACSR_V};
     let m = c.macsr;
     let fast_mode = m & (MACSR_RT | MACSR_SU) == 0;
@@ -979,6 +1113,7 @@ pub fn decode(c: &Cpu, pc: u32) -> Op {
         Some(mut o) => {
             o.op = op;
             o.len = (rd.p.wrapping_sub(pc)) as u8;
+            o.k = classify(&o);
             o.end |= matches!(op >> 12, 0x6) || matches!(op & 0xFFC0, 0x4E80 | 0x4EC0);
             o
         }
@@ -1017,7 +1152,7 @@ pub fn build_block(c: &mut Cpu, pc: u32) -> usize {
 }
 
 fn mk(h: Handler) -> Op {
-    Op { h, len: 0, end: false, r: 0, op: 0, a: Ea::D(0), b: Ea::D(0), x: 0 }
+    Op { h, k: Kind::Call, len: 0, end: false, r: 0, op: 0, a: Ea::D(0), b: Ea::D(0), x: 0 }
 }
 
 fn single_word(op: u16) -> bool {

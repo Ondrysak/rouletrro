@@ -23,6 +23,19 @@ fn num(s: &str) -> u64 {
     n.parse::<f64>().map(|v| (v * mul as f64) as u64).expect("number")
 }
 
+/// Run `m` to clock `t`. -> why it could not, if it could not.
+fn run_to(m: &mut Machine, t: u64) -> Option<String> {
+    let mut last = m.now();
+    while m.now() < t {
+        let s = m.run_until(t);
+        if m.now() == last {
+            return Some(format!("stuck at clock {} ({s:?})", m.now()));
+        }
+        last = m.now();
+    }
+    None
+}
+
 fn machine(fw: &Firmware, snap: &str, jit: bool) -> Machine {
     let mut m = Machine::new(fw, 128).unwrap();
     if !jit {
@@ -129,8 +142,8 @@ fn main() {
     let mut b = machine(&fw, &snap, true);
     let start = a.now();
     if from > 0 {
-        a.run_until(start + from);
-        b.run_until(start + from);
+        run_to(&mut a, start + from);
+        run_to(&mut b, start + from);
     }
     let (mut ta, mut tb) = (0.0, 0.0);
     let mut t = a.now();
@@ -138,11 +151,14 @@ fn main() {
     while t < end {
         t = (t + every).min(end);
         let s = Instant::now();
-        a.run_until(t);
+        let wa = run_to(&mut a, t);
         ta += s.elapsed().as_secs_f64();
         let s = Instant::now();
-        b.run_until(t);
+        let wb = run_to(&mut b, t);
         tb += s.elapsed().as_secs_f64();
+        if wa.is_some() || wb.is_some() {
+            println!("interp: {wa:?}; jit: {wb:?}");
+        }
         let d = diff(&a, &b);
         if !d.is_empty() {
             println!("MISMATCH by clock {t} (previous checkpoint {}):", t - every);
@@ -152,14 +168,16 @@ fn main() {
             std::process::exit(1);
         }
     }
+    println!("idle-skipped: interp {} jit {}", a.stats.idle_skipped, b.stats.idle_skipped);
     let j = b.cpu.jit.as_ref().unwrap();
     println!(
-        "identical through clock {t}: {} instructions; interp {ta:.2}s, jit {tb:.2}s ({:.2}x); {} blocks compiled in {:.2}s, {} declined; {} cache flushes",
+        "identical through clock {t}: {} instructions; interp {ta:.2}s, jit {tb:.2}s ({:.2}x); {} blocks compiled in {:.2}s, {} declined; {} cache flushes; {} entries into compiled code",
         t - start,
         ta / tb.max(1e-9),
         j.compiled,
         j.compile_secs,
         j.failed,
-        b.cpu.bus.icache_flushes
+        b.cpu.bus.icache_flushes,
+        j.runs
     );
 }

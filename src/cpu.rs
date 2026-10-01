@@ -65,6 +65,9 @@ pub(crate) enum Loc {
     I(u32),
 }
 
+// `reg` and the block compiler index Rn as 0-15 from the struct's start.
+const _: () = assert!(std::mem::offset_of!(Cpu, d) == 0 && std::mem::offset_of!(Cpu, a) == 32);
+
 /// `repr(C)` keeps `a` straight after `d`, so `reg` can index Rn as 0-15.
 #[repr(C)]
 pub struct Cpu {
@@ -108,6 +111,8 @@ pub struct Cpu {
     pub history: Option<(Vec<u32>, usize)>,
     /// The block compiler; None runs every block on the interpreter.
     pub jit: Option<Box<crate::jit::Jit>>,
+    /// `run`'s clock limit, for compiled loops deciding to go round again.
+    pub limit: u64,
     /// The first few faults: (vector, pc, opcode, clock).
     pub fault_log: Vec<(u8, u32, u16, u64)>,
 }
@@ -166,6 +171,7 @@ impl Cpu {
             fault_log: Vec::new(),
             history: None,
             jit: None,
+            limit: 0,
             profile: None,
             next_sample: 0,
         }
@@ -502,6 +508,7 @@ impl Cpu {
     /// Execute until the clock reaches `until`, a peripheral event falls
     /// due, a hook is hit, or the core stops with nothing to wake it.
     pub fn run(&mut self, until: u64) -> Stop {
+        self.limit = until;
         loop {
             // Interrupts are sampled between instructions.
             let lvl = self.bus.io.irq_level;
@@ -581,6 +588,9 @@ impl Cpu {
         if self.jit.is_some() && self.bus.watch.is_none() {
             let blk = &mut self.bus.blk_arena[i];
             if let Some(f) = blk.code {
+                if let Some(j) = &mut self.jit {
+                    j.runs += 1;
+                }
                 // SAFETY: compiled for this block, which is still cached.
                 unsafe { f(self) };
                 return;
@@ -604,11 +614,17 @@ impl Cpu {
         if jit.epoch != self.bus.icache_flushes {
             jit.reset(self.bus.icache_flushes);
         }
+        let mem = crate::jit::Mem::of(&mut self.bus);
         let blk = &mut self.bus.blk_arena[i];
-        let f = jit.compile(pc, &blk.ops);
+        let f = jit.compile(pc, &blk.ops, mem);
         blk.code = f;
         blk.no_jit = f.is_none();
         f
+    }
+
+    /// `run_ops` for a block given as a slice (compiled code falling back).
+    pub(crate) fn run_ops_slice(&mut self, pc: u32, ops: &[crate::fast::Op]) {
+        self.run_ops(pc, ops as *const [crate::fast::Op]);
     }
 
     /// Run the predecoded block `blk`, which starts at `pc`. Stops early

@@ -193,6 +193,16 @@ fn move_acc_to_acc() {
 /// `mac_core`, over random operands, modes, accumulators and load forms.
 #[test]
 fn fast_mac_matches_interpreter() {
+    check_mac(false);
+}
+
+/// The same through the block compiler.
+#[test]
+fn jit_mac_matches_interpreter() {
+    check_mac(true);
+}
+
+fn check_mac(jit: bool) {
     let mut seed: u64 = 0x9E3779B97F4A7C15;
     let mut rnd = move || {
         seed ^= seed << 13;
@@ -250,7 +260,16 @@ fn fast_mac_matches_interpreter() {
         setup(&mut f);
         f.pc = CODE;
         f.sr = 0x2700;
-        f.step();
+        if jit {
+            let ops = vec![dtemu::fast::decode(&f, CODE)];
+            let mut j = dtemu::jit::Jit::new(0);
+            let mem = dtemu::jit::Mem::of(&mut f.bus);
+            let code = j.compile(CODE, &ops, mem).expect("compiles");
+            // SAFETY: compiled from `ops`, alive for the call.
+            unsafe { code(&mut f) };
+        } else {
+            f.step();
+        }
         // Interpreter.
         let mut s = Cpu::new(Bus::new(128));
         for k in 0..0x800u32 {

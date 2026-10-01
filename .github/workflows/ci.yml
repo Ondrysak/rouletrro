@@ -32,3 +32,5 @@ jobs:
         run: |
           pip install "unicorn==2.1.4"
           python3 tools/cfdiff.py 4000
+      - name: Block compiler against Unicorn
+        run: CFDIFF_JIT=1 python3 tools/cfdiff.py 4000

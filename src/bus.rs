@@ -47,7 +47,7 @@ pub struct Bus {
     blk_map: Vec<u32>,
     pub(crate) blk_arena: Vec<Block>,
     code_bits: Vec<u64>,
-    flush_pending: bool,
+    pub(crate) flush_pending: bool,
     pub icache_flushes: u64,
     icache_span: u32,
     pub icache_on: bool,
@@ -161,6 +161,14 @@ impl Bus {
             return None;
         }
         Some(o)
+    }
+
+    /// What compiled code needs to reach DDR directly: its base, the
+    /// address mask, its length, and the cached code window as DDR offsets
+    /// (a store starting there must go through `write*` for `check_code`).
+    pub fn jit_mem(&mut self) -> (*mut u8, u32, u32, u32, u32, *mut u8) {
+        let lo = CODE_BASE - 0x4000_0000;
+        (self.ddr.as_mut_ptr(), self.ddr_mask, self.ddr.len() as u32, lo, self.icache_span, self.sram.as_mut_ptr())
     }
 
     #[inline(always)]
