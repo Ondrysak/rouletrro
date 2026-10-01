@@ -156,6 +156,11 @@ impl Bus {
         Some((id - 1) as usize)
     }
 
+    /// The predecoded ops of the block starting at `pc`, if one is built.
+    pub fn block_ops(&self, pc: u32) -> Option<&[crate::fast::Op]> {
+        self.block_at(pc).map(|i| &*self.blk_arena[i].ops)
+    }
+
     /// DDR offset of `[a, a + len)` when all of it is plain DDR that no
     /// watchpoint or cached code covers, so it can be moved directly.
     #[inline(always)]
@@ -247,6 +252,11 @@ impl Bus {
                 }
             }
         }
+    }
+
+    /// `sram_off` for the rest of the crate.
+    pub(crate) fn sram_offset(addr: u32) -> Option<usize> {
+        Self::sram_off(addr)
     }
 
     /// Offset into SRAM for an address in its 0x80000000-0x8BFFFFFF window.

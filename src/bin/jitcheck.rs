@@ -5,8 +5,10 @@
 //! a compiler bug, found within one checkpoint interval.
 //!
 //!     jitcheck SNAPSHOT [--instr N] [--every N] [--from N]
+//!     jitcheck --compare A.snap B.snap
 //!
-//! With no snapshot (`-`), both cold-boot from reset.
+//! With no snapshot (`-`), both cold-boot from reset. `--compare` holds two
+//! saved machines to the same test, e.g. one build's against another's.
 
 use dtemu::firmware::Firmware;
 use dtemu::machine::Machine;
@@ -124,8 +126,21 @@ fn diff(a: &Machine, b: &Machine) -> Vec<String> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
-        println!("usage: jitcheck SNAPSHOT|- [--instr N] [--every N] [--from N]");
+        println!("usage: jitcheck SNAPSHOT|- [--instr N] [--every N] [--from N]\n       jitcheck --compare A.snap B.snap");
         return;
+    }
+    if args[0] == "--compare" {
+        let fw = Firmware::load(std::path::Path::new("fw/Digitakt_OS1.53.syx"), None).unwrap();
+        let (a, b) = (machine(&fw, &args[1], false), machine(&fw, &args[2], false));
+        let d = diff(&a, &b);
+        if d.is_empty() {
+            println!("identical");
+            return;
+        }
+        for l in d.iter().take(30) {
+            println!("  {}", l.replace("interp", "A").replace("jit", "B"));
+        }
+        std::process::exit(1);
     }
     let snap = args[0].clone();
     let (mut instr, mut every, mut from) = (200_000_000u64, 10_000_000u64, 0u64);

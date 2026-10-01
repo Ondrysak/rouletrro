@@ -333,9 +333,29 @@ fn main() {
         println!("distinct opcodes: {}", ov.len());
         let mut blocks: Vec<(u32, u64)> = p.iter().map(|(a, n)| (*a, *n)).collect();
         blocks.sort_by(|a, b| b.1.cmp(&a.1));
-        println!("hottest blocks:");
-        for (a, n) in blocks.iter().take(20) {
-            println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total as f64);
+        println!("hottest blocks (ops, of which the compiler calls a handler for):");
+        let mut calls: std::collections::HashMap<u16, f64> = Default::default();
+        let mut call_share = 0.0;
+        for (rank, (a, n)) in blocks.iter().enumerate() {
+            let share = *n as f64 * 100.0 / total as f64;
+            let ops = m.cpu.bus.block_ops(*a).unwrap_or_default();
+            let called: Vec<u16> = ops.iter().filter(|o| matches!(o.k, dtemu::fast::Kind::Call)).map(|o| o.op).collect();
+            if !ops.is_empty() {
+                for &o in &called {
+                    *calls.entry(o).or_insert(0.0) += share / ops.len() as f64;
+                }
+                call_share += share * called.len() as f64 / ops.len() as f64;
+            }
+            if rank < 25 {
+                let c: Vec<String> = called.iter().map(|o| format!("{o:04x}")).collect();
+                println!("  {a:08x} {share:5.1}%  {:>3} ops, {} calls {}", ops.len(), called.len(), c.join(" "));
+            }
+        }
+        let mut cv: Vec<_> = calls.into_iter().collect();
+        cv.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!("ops run as handler calls: about {call_share:.1}% of instructions; by opcode:");
+        for (o, f) in cv.iter().take(30) {
+            println!("  {o:04x} {f:5.2}%");
         }
         println!("guest profile ({total} samples), by 256-byte region:");
         for (a, n) in v.iter().take(25) {
