@@ -205,6 +205,7 @@ impl Jit {
             self.ctx.set_disasm(true);
         }
         let ok = module.define_function(id, &mut self.ctx).is_ok();
+        let size = self.ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
         if dump {
             if let Some(v) = self.ctx.compiled_code().and_then(|c| c.vcode.clone()) {
                 eprintln!("{v}");
@@ -217,6 +218,17 @@ impl Jit {
         }
         module.finalize_definitions().ok()?;
         let code = module.get_finalized_function(id);
+        // DTEMU_JIT_MAP=FILE: append each function's address, size, entry
+        // pc and machine code (hex), for matching a profile of the host.
+        if let Some(path) = std::env::var_os("DTEMU_JIT_MAP") {
+            use std::io::Write;
+            // SAFETY: `size` bytes of code were just written there.
+            let bytes = unsafe { std::slice::from_raw_parts(code, size) };
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "{:x} {size} {pc:08x} 1 {hex}", code as usize);
+            }
+        }
         // SAFETY: the function was built with BlockFn's signature.
         Some(unsafe { std::mem::transmute::<*const u8, BlockFn>(code) })
     }
@@ -370,6 +382,13 @@ fn inline_ok(o: &Op) -> bool {
     }
 }
 
+/// Can EMAC state stay in variables across this op? Translated ops and
+/// branches, and calls to handlers that cannot touch it: every EMAC
+/// instruction is in line A. (State is written back before a call.)
+fn mac_safe(o: &Op) -> bool {
+    inline_ok(o) || matches!(o.k, Kind::Bcc | Kind::Bra) || (o.k == Kind::Call && o.op >> 12 != 0xA)
+}
+
 /// Which condition codes each op must leave correct: (N Z V C, X).
 fn flag_liveness(ops: &[Op]) -> Vec<(bool, bool)> {
     let mut out = vec![(true, true); ops.len()];
@@ -452,11 +471,15 @@ struct Tx<'a> {
     macsr_st: St,
     accs: [Variable; 4],
     acc_st: [St; 4],
-    /// The last accumulator result that set MACSR's N Z V EV, and that
-    /// accumulator's PAV bit (0: none since the block began), so the bits
-    /// are worked out once, when MACSR is written back.
+    /// The last accumulator result that set MACSR's N Z V EV (`lastany`:
+    /// whether one has since the block began), so the bits are worked out
+    /// once, when MACSR is written back. V is that accumulator's PAV bit
+    /// (`lastpav`) as it is then, or, once a MOVCLR has cleared PAV, the V
+    /// it had at that point (`lastvfix`).
     lastv: Variable,
     lastpav: Variable,
+    lastvfix: Variable,
+    lastany: Variable,
     /// The op being translated, for the clock a slow access must see.
     i: usize,
     /// Its address.
@@ -482,10 +505,14 @@ impl<'a> Tx<'a> {
         let fr = b.declare_var(types::I32);
         let lastv = b.declare_var(types::I64);
         let lastpav = b.declare_var(types::I32);
+        let lastvfix = b.declare_var(types::I32);
+        let lastany = b.declare_var(types::I32);
         let z64 = b.ins().iconst(types::I64, 0);
         let z32 = b.ins().iconst(types::I32, 0);
         b.def_var(lastv, z64);
         b.def_var(lastpav, z32);
+        b.def_var(lastvfix, z32);
+        b.def_var(lastany, z32);
         Tx {
             b,
             cpu,
@@ -512,6 +539,8 @@ impl<'a> Tx<'a> {
             acc_st: [St::Unloaded; 4],
             lastv,
             lastpav,
+            lastvfix,
+            lastany,
             i: 0,
             op_pc: 0,
         }
@@ -609,21 +638,34 @@ impl<'a> Tx<'a> {
 
     // -- memory ---------------------------------------------------------------
 
-    /// The host address for an inline access of `sz` bytes at `addr`
-    /// through page table `table`. -> (condition, host address)
-    fn page(&mut self, table: *const usize, addr: Value, sz: u8) -> (Value, Value) {
+    /// The inline path for an access of `sz` bytes at `addr` through page
+    /// table `table`: branches to `slow` unless the page is plain memory
+    /// and the access inside it (an aligned one always is), and otherwise
+    /// leaves the builder in a new block with the host address.
+    fn page(&mut self, table: *const usize, addr: Value, sz: u8, slow: cranelift_codegen::ir::Block) -> Value {
         let pg = self.b.ins().ushr_imm_u(addr, 16);
         let pg = self.b.ins().uextend(self.ptr, pg);
         let pg = self.b.ins().ishl_imm_u(pg, 3);
         let t = self.b.ins().iconst(self.ptr, table as usize as i64);
         let e = self.b.ins().iadd(t, pg);
         let host = self.b.ins().load(self.ptr, mf(), e, 0);
+        let mapped = self.b.create_block();
+        self.b.ins().brif(host, mapped, &[], slow, &[]);
+        self.b.switch_to_block(mapped);
         let off = self.b.ins().band_imm_u(addr, 0xFFFF);
-        let mapped = self.b.ins().icmp_imm_u(IntCC::NotEqual, host, 0);
-        let inside = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, off, 0x1_0000 - sz as i64);
-        let ok = self.b.ins().band(mapped, inside);
+        if sz > 1 {
+            // Aligned is inside; a misaligned access is checked.
+            let mis = self.b.ins().band_imm_u(addr, sz as i64 - 1);
+            let (fast, check) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(mis, check, &[], fast, &[]);
+            self.b.switch_to_block(check);
+            self.b.set_cold_block(check);
+            let inside = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, off, 0x1_0000 - sz as i64);
+            self.b.ins().brif(inside, fast, &[], slow, &[]);
+            self.b.switch_to_block(fast);
+        }
         let off = self.b.ins().uextend(self.ptr, off);
-        (ok, self.b.ins().iadd(host, off))
+        self.b.ins().iadd(host, off)
     }
 
     fn load_be(&mut self, p: Value, sz: u8) -> Value {
@@ -663,14 +705,10 @@ impl<'a> Tx<'a> {
     /// A read as `Bus::read*` makes it: plain memory inline, the rest
     /// through the bus.
     fn read(&mut self, addr: Value, sz: u8) -> Value {
-        let (ok, p) = self.page(self.mem.rd_pages, addr, sz);
-        let fast = self.b.create_block();
         let slow = self.b.create_block();
         let join = self.b.create_block();
         self.b.append_block_param(join, types::I32);
-        self.b.ins().brif(ok, fast, &[], slow, &[]);
-
-        self.b.switch_to_block(fast);
+        let p = self.page(self.mem.rd_pages, addr, sz, slow);
         let v = self.load_be(p, sz);
         self.b.ins().jump(join, &[v.into()]);
 
@@ -691,13 +729,9 @@ impl<'a> Tx<'a> {
     /// A write as `Bus::write*` makes it (stores near cached code go
     /// through the bus, which tells the block cache).
     fn write(&mut self, addr: Value, sz: u8, v: Value) {
-        let (ok, p) = self.page(self.mem.wr_pages, addr, sz);
-        let fast = self.b.create_block();
         let slow = self.b.create_block();
         let join = self.b.create_block();
-        self.b.ins().brif(ok, fast, &[], slow, &[]);
-
-        self.b.switch_to_block(fast);
+        let p = self.page(self.mem.wr_pages, addr, sz, slow);
         self.store_be(p, sz, v);
         self.b.ins().jump(join, &[]);
 
@@ -1556,14 +1590,10 @@ impl<'a> Tx<'a> {
         };
         let x64 = self.b.ins().sextend(types::I64, x);
         let y64 = self.b.ins().sextend(types::I64, y);
+        // The fractional product, (x * y) << 1 >> 24 in 40 bits: the same
+        // as x * y >> 23 for every input, -1.0 * -1.0 included (2^39).
         let prod = self.b.ins().imul(x64, y64);
-        let prod = self.b.ins().ishl_imm_u(prod, 1);
-        let prod = self.b.ins().sshr_imm_u(prod, 24);
-        let xm = self.b.ins().icmp_imm_u(IntCC::Equal, x, 0x8000_0000u32 as i32 as i64);
-        let ym = self.b.ins().icmp_imm_u(IntCC::Equal, y, 0x8000_0000u32 as i32 as i64);
-        let both = self.b.ins().band(xm, ym);
-        let one = self.b.ins().iconst(types::I64, 1i64 << 39);
-        let p = self.b.ins().select(both, one, prod);
+        let p = self.b.ins().sshr_imm_u(prod, 23);
         let cur = self.b.ins().load(types::I64, mf(), self.cpu, Self::acc_off(acc));
         let sum = if ext & 0x100 != 0 { self.b.ins().isub(cur, p) } else { self.b.ins().iadd(cur, p) };
         let e48 = self.b.ins().ishl_imm_u(sum, 16);
@@ -1638,9 +1668,22 @@ impl<'a> Tx<'a> {
         self.acc_st[i] = St::Dirty;
     }
 
+    /// MOVCLR is about to clear PAV: fix the pending V as it is now.
+    fn fix_pending_v(&mut self) {
+        let lp = self.b.use_var(self.lastpav);
+        let m = self.b.use_var(self.macsr);
+        let fix = self.b.use_var(self.lastvfix);
+        let pv = self.b.ins().band(m, lp);
+        let pv_on = self.b.ins().icmp_imm_u(IntCC::NotEqual, pv, 0);
+        let vbit = self.k(crate::cpu::MACSR_V as i64);
+        let vb = self.b.ins().select(pv_on, vbit, fix);
+        let zero = self.k(0);
+        self.b.def_var(self.lastvfix, vb);
+        self.b.def_var(self.lastpav, zero);
+    }
+
     /// Work MACSR's N Z V EV out from the last MAC that set them, as that
-    /// MAC would have (V: its accumulator's PAV, which nothing has cleared
-    /// since -- MOVCLR settles first).
+    /// MAC would have (V: its accumulator's PAV, or as MOVCLR fixed it).
     fn settle_macsr(&mut self) {
         let lp = self.b.use_var(self.lastpav);
         let v = self.b.use_var(self.lastv);
@@ -1656,7 +1699,8 @@ impl<'a> Tx<'a> {
         let pv = self.b.ins().band(m, lp);
         let pv_on = self.b.ins().icmp_imm_u(IntCC::NotEqual, pv, 0);
         let vbit = self.k(crate::cpu::MACSR_V as i64);
-        let vb = self.b.ins().select(pv_on, vbit, zero);
+        let fix = self.b.use_var(self.lastvfix);
+        let vb = self.b.ins().select(pv_on, vbit, fix);
         let t = self.b.ins().sshr_imm_u(v, 39);
         let t0 = self.b.ins().icmp_imm_s(IntCC::Equal, t, 0);
         let tm = self.b.ins().icmp_imm_s(IntCC::Equal, t, -1);
@@ -1667,10 +1711,12 @@ impl<'a> Tx<'a> {
         let low = self.b.ins().bor(low, ev);
         let hi = self.b.ins().band_imm_u(m, !0xF & 0xFFFF_FFFF);
         let new = self.b.ins().bor(hi, low);
-        let any = self.b.ins().icmp_imm_u(IntCC::NotEqual, lp, 0);
+        let any = self.b.use_var(self.lastany);
         let m2 = self.b.ins().select(any, new, m);
         self.b.def_var(self.macsr, m2);
         self.b.def_var(self.lastpav, zero);
+        self.b.def_var(self.lastvfix, zero);
+        self.b.def_var(self.lastany, zero);
     }
 
     /// MAC/MSAC with the EMAC state in variables (the block checked the
@@ -1735,14 +1781,10 @@ impl<'a> Tx<'a> {
         };
         let x64 = self.b.ins().sextend(types::I64, x);
         let y64 = self.b.ins().sextend(types::I64, y);
+        // The fractional product, (x * y) << 1 >> 24 in 40 bits: the same
+        // as x * y >> 23 for every input, -1.0 * -1.0 included (2^39).
         let prod = self.b.ins().imul(x64, y64);
-        let prod = self.b.ins().ishl_imm_u(prod, 1);
-        let prod = self.b.ins().sshr_imm_u(prod, 24);
-        let xm = self.b.ins().icmp_imm_u(IntCC::Equal, x, 0x8000_0000u32 as i32 as i64);
-        let ym = self.b.ins().icmp_imm_u(IntCC::Equal, y, 0x8000_0000u32 as i32 as i64);
-        let both = self.b.ins().band(xm, ym);
-        let one = self.b.ins().iconst(types::I64, 1i64 << 39);
-        let p = self.b.ins().select(both, one, prod);
+        let p = self.b.ins().sshr_imm_u(prod, 23);
         let sum = if ext & 0x100 != 0 { self.b.ins().isub(cur, p) } else { self.b.ins().iadd(cur, p) };
         let e48 = self.b.ins().ishl_imm_u(sum, 16);
         let e48 = self.b.ins().sshr_imm_u(e48, 16);
@@ -1767,6 +1809,9 @@ impl<'a> Tx<'a> {
         self.macsr_st = St::Dirty;
         self.b.def_var(self.lastv, v);
         self.b.def_var(self.lastpav, pk);
+        self.b.def_var(self.lastvfix, zero);
+        let one = self.k(1);
+        self.b.def_var(self.lastany, one);
         self.b.ins().jump(after, &[]);
 
         self.b.switch_to_block(after);
@@ -1806,8 +1851,8 @@ impl<'a> Tx<'a> {
         };
         self.set_reg((o.r & 15) as usize, v);
         if o.x & 0x100 != 0 {
-            // Clearing PAV changes what a pending V would be: settle first.
-            self.settle_macsr();
+            // Clearing PAV changes what a pending V would be: fix it first.
+            self.fix_pending_v();
             let z = self.b.ins().iconst(types::I64, 0);
             self.set_acc(i, z);
             let m = self.b.use_var(self.macsr);
@@ -1885,7 +1930,7 @@ impl<'a> Tx<'a> {
         // MACSR), and one check on entry, running the block on the
         // interpreter if the mode is another.
         let has_mac = ops.iter().any(|o| matches!(o.k, Kind::Mac { .. } | Kind::MovAcc));
-        if translate && has_mac && ops.iter().all(|o| inline_ok(o) || matches!(o.k, Kind::Bcc | Kind::Bra)) {
+        if translate && has_mac && ops.iter().all(mac_safe) {
             use crate::cpu::{MACSR_FI, MACSR_OMC, MACSR_RT, MACSR_SU};
             self.omc = self.mem.macsr & MACSR_OMC != 0;
             let want = MACSR_FI | if self.omc { MACSR_OMC } else { 0 };

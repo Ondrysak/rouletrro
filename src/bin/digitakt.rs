@@ -42,6 +42,7 @@ struct Audio {
 
 struct Opts {
     syx: PathBuf,
+    main_os: Option<PathBuf>,
     snapshot: Option<PathBuf>,
     ips: f64,
     audio: bool,
@@ -60,6 +61,7 @@ struct Opts {
 fn parse() -> Opts {
     let mut o = Opts {
         syx: PathBuf::from("fw/Digitakt_OS1.53.syx"),
+        main_os: None,
         snapshot: None,
         ips: 200e6,
         audio: true,
@@ -77,6 +79,7 @@ fn parse() -> Opts {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--main-os" => o.main_os = it.next().map(PathBuf::from),
             "--snapshot" => o.snapshot = it.next().map(PathBuf::from),
             "--ips" => o.ips = it.next().unwrap().replace('M', "e6").parse().expect("--ips"),
             "--no-audio" => o.audio = false,
@@ -102,7 +105,7 @@ fn parse() -> Opts {
                 println!(
                     "usage: digitakt [FIRMWARE.syx] [--snapshot FILE] [--card IMAGE] [--ips N] [--no-audio]\n\
                      \x20                [--headless --after SECS --screenshot OUT.png] [--press CODE@SECS] [--turn ENC:DELTA@SECS]\n\
-                     \x20                [--latency MS] [--audio-null] [--wav OUT.wav]"
+                     \x20                [--latency MS] [--audio-null] [--wav OUT.wav] [--main-os IMAGE.bin]"
                 );
                 std::process::exit(0);
             }
@@ -324,7 +327,7 @@ fn start_audio(audio: Arc<Audio>) -> Option<cpal::Stream> {
 
 fn main() {
     let o = parse();
-    let fw = Firmware::from_file(&o.syx).unwrap_or_else(|e| {
+    let fw = Firmware::load(&o.syx, o.main_os.as_deref()).unwrap_or_else(|e| {
         eprintln!("{}: {e}", o.syx.display());
         std::process::exit(1)
     });
@@ -332,6 +335,9 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1)
     });
+    for l in m.profile_notes() {
+        eprintln!("{l}");
+    }
     // The card first: a snapshot then brings its own sectors (the firmware's
     // cached view of the drive matches those) and keeps the image path.
     let mut image = None;

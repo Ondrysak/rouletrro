@@ -11,7 +11,7 @@ fn main() {
         println!("usage: dtpeek SNAPSHOT tcd N | mem ADDR LEN | leds | uart [FROM] | replay | fb");
         return;
     }
-    let fw = Firmware::from_file(std::path::Path::new("fw/Digitakt_OS1.53.syx")).unwrap();
+    let fw = Firmware::load(std::path::Path::new("fw/Digitakt_OS1.53.syx"), None).unwrap();
     let mut m = Machine::new(&fw, 128).unwrap();
     dtemu::snapshot::load(&mut m, std::path::Path::new(&a[0])).unwrap();
     match a[1].as_str() {

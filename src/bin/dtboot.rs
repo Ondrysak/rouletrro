@@ -22,11 +22,13 @@ const USAGE: &str = "\
 usage: dtboot [FIRMWARE.syx] [options]
 
 Runs the firmware headless and reports progress. Clocks are instruction
-counts (suffixes k, M, G).
+counts (suffixes k, M, G); after --load they count from the snapshot's.
 
   --instr N            run N instructions (default 100M)
   --every N            report every N (default 10M)
   --ips N              instructions per emulated second (default 200M)
+  --main-os IMAGE.bin  run this MAIN OS (raw, as fwinfo -o extracts it)
+                       in place of the update's
   --load SNAP          resume a snapshot
   --save SNAP          save a snapshot at the end
   --card IMAGE         back the eMMC with an image file (read only: changes
@@ -53,6 +55,7 @@ Environment:
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut syx = None;
+    let mut main_os: Option<String> = None;
     let mut instr = 100_000_000u64;
     let mut every = 10_000_000u64;
     let mut ips = None;
@@ -74,6 +77,7 @@ fn main() {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--main-os" => main_os = it.next().cloned(),
             "--instr" => instr = num(it.next().unwrap()),
             "--every" => every = num(it.next().unwrap()),
             "--ips" => ips = Some(num(it.next().unwrap())),
@@ -123,8 +127,11 @@ fn main() {
         }
     }
     let syx = syx.unwrap_or_else(|| "fw/Digitakt_OS1.53.syx".into());
-    let fw = Firmware::from_file(std::path::Path::new(&syx)).unwrap();
+    let fw = Firmware::load(std::path::Path::new(&syx), main_os.as_deref().map(std::path::Path::new)).unwrap();
     let mut m = Machine::new(&fw, 128).unwrap();
+    for l in m.profile_notes() {
+        println!("{l}");
+    }
     if let Some(i) = ips {
         m.cpu.bus.io.ips = i as f64;
     }
@@ -150,9 +157,23 @@ fn main() {
         println!("card {p}: {} sectors in use{}", m.cpu.bus.io.esdhc.card.sectors.len(), if fresh { " (new, sample area formatted)" } else { "" });
     }
     if let Some(p) = &load {
-        dtemu::snapshot::load(&mut m, std::path::Path::new(p)).unwrap();
+        if let Err(e) = dtemu::snapshot::load(&mut m, std::path::Path::new(p)) {
+            eprintln!("{p}: {e}");
+            std::process::exit(1);
+        }
         println!("restored {p} at clock {}", m.now());
-        instr += m.now();
+        // Every clock given counts from the snapshot's.
+        let base = m.now();
+        instr += base;
+        for p in &mut presses {
+            p.1 += base;
+        }
+        for t in &mut turns {
+            t.0 += base;
+        }
+        if let Some(pa) = &mut profile_after {
+            *pa += base;
+        }
     }
     let t0 = Instant::now();
     let (clock0, idle0) = (m.now(), m.stats.idle_skipped);
@@ -312,16 +333,36 @@ fn main() {
         println!("distinct opcodes: {}", ov.len());
         let mut blocks: Vec<(u32, u64)> = p.iter().map(|(a, n)| (*a, *n)).collect();
         blocks.sort_by(|a, b| b.1.cmp(&a.1));
-        println!("hottest blocks:");
-        for (a, n) in blocks.iter().take(20) {
-            println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total as f64);
+        println!("hottest blocks (ops, of which the compiler calls a handler for):");
+        let mut calls: std::collections::HashMap<u16, f64> = Default::default();
+        let mut call_share = 0.0;
+        for (rank, (a, n)) in blocks.iter().enumerate() {
+            let share = *n as f64 * 100.0 / total as f64;
+            let ops = m.cpu.bus.block_ops(*a).unwrap_or_default();
+            let called: Vec<u16> = ops.iter().filter(|o| matches!(o.k, dtemu::fast::Kind::Call)).map(|o| o.op).collect();
+            if !ops.is_empty() {
+                for &o in &called {
+                    *calls.entry(o).or_insert(0.0) += share / ops.len() as f64;
+                }
+                call_share += share * called.len() as f64 / ops.len() as f64;
+            }
+            if rank < 25 {
+                let c: Vec<String> = called.iter().map(|o| format!("{o:04x}")).collect();
+                println!("  {a:08x} {share:5.1}%  {:>3} ops, {} calls {}", ops.len(), called.len(), c.join(" "));
+            }
+        }
+        let mut cv: Vec<_> = calls.into_iter().collect();
+        cv.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!("ops run as handler calls: about {call_share:.1}% of instructions; by opcode:");
+        for (o, f) in cv.iter().take(30) {
+            println!("  {o:04x} {f:5.2}%");
         }
         println!("guest profile ({total} samples), by 256-byte region:");
         for (a, n) in v.iter().take(25) {
             println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total as f64);
         }
     }
-    println!("+Drive mounted: {}", m.drive_mounted());
+    println!("+Drive mounted: {}", m.drive_mounted().map_or("unknown (flag not found in this build)".into(), |v| v.to_string()));
     println!("icache: {} decodes, {} invalidating stores", m.cpu.bus.icache_decodes, m.cpu.bus.icache_invalidations);
     let c = &m.cpu;
     for (pc, a, n, v) in c.bus.watch_log.iter().take(40) {

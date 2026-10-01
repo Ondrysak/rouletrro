@@ -8,7 +8,6 @@
 
 use crate::io::Io;
 use crate::machine::{Machine, Stats};
-use crate::symbols::MAIN_OS_SHA256;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -82,7 +81,7 @@ pub fn save(m: &Machine, path: &Path) -> std::io::Result<()> {
     let mut sparse: Vec<(u32, &[u8])> = c.bus.sparse.iter().map(|(k, v)| (*k, &v[..])).collect();
     sparse.sort_by_key(|x| x.0);
     let snap = SnapRef {
-        main_sha256: MAIN_OS_SHA256.to_string(),
+        main_sha256: m.prof.sha256.clone(),
         cpu,
         io: &c.bus.io,
         sram: &c.bus.sram,
@@ -117,8 +116,11 @@ pub fn load(m: &mut Machine, path: &Path) -> Result<(), String> {
     let mut body = Vec::new();
     f.read_to_end(&mut body).map_err(|e| e.to_string())?;
     let s: Snap = bincode::deserialize(&body).map_err(|e| e.to_string())?;
-    if s.main_sha256 != MAIN_OS_SHA256 {
-        return Err("snapshot was taken on a different MAIN OS".into());
+    if s.main_sha256 != m.prof.sha256 {
+        return Err(format!(
+            "snapshot was taken on a different MAIN OS (sha256 {}, this one is {})",
+            s.main_sha256, m.prof.sha256
+        ));
     }
     let ddr = lz4_flex::decompress_size_prepended(&s.ddr_lz4).map_err(|e| e.to_string())?;
     if ddr.len() != m.cpu.bus.ddr.len() {

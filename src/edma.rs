@@ -209,6 +209,124 @@ impl Bus {
         self.dma_minor_done(ch, citer, s, d)
     }
 
+    /// Where `[a, a + n)` is plain memory a transfer may touch directly --
+    /// DDR no watchpoint or cached code covers, or SRAM -- its first byte.
+    fn plain_ptr(&mut self, a: u32, n: u32) -> Option<*mut u8> {
+        if let Some(o) = self.ddr_plain(a, n) {
+            return Some(self.ddr[o..].as_mut_ptr());
+        }
+        let o = Self::sram_offset(a)?;
+        if o + n as usize <= crate::bus::SRAM_SIZE && Self::sram_offset(a.wrapping_add(n - 1)) == Some(o + n as usize - 1) {
+            return Some(self.sram[o..].as_mut_ptr());
+        }
+        None
+    }
+
+    /// Run channel `ch`'s minor loops, from the first, for as long as each
+    /// moves plain memory only, and without a minor link elsewhere: what `dma_minor`
+    /// would do loop by loop, with the descriptor read once and written
+    /// back once, and each loop a direct copy. Stops after the major loop
+    /// (whose completion it runs) or before a loop it cannot copy, which
+    /// `dma_minor` then runs. -> loops run.
+    fn dma_minors_plain(&mut self, ch: usize, max: u32) -> u32 {
+        let t = self.tcd(ch);
+        // A minor link to the channel itself does nothing (as in
+        // `dma_minor_done`); one to another channel runs there.
+        if Tcd::link(t.citer).is_some_and(|l| l != ch) {
+            return 0;
+        }
+        let mut count = Tcd::count(t.citer);
+        let ssize = size_of(t.attr >> 8);
+        let dsize = size_of(t.attr);
+        let (smod, dmod) = ((t.attr >> 11) & 0x1F, (t.attr >> 3) & 0x1F);
+        let nbytes = t.nbytes & 0x3FFF_FFFF;
+        // Small loops only; a source chunk at most rounds a loop up.
+        if nbytes == 0 || nbytes + ssize > 256 || nbytes.div_ceil(ssize) > 32 || (nbytes + ssize) / dsize > 64 {
+            return 0;
+        }
+        let soff = t.soff as i16 as i32 as u32;
+        let doff = t.doff as i16 as i32 as u32;
+        let half = Tcd::count(t.biter) / 2;
+        let (mut s, mut d) = (t.saddr, t.daddr);
+        let mut done = 0;
+        let mut src = [std::ptr::null_mut::<u8>(); 32];
+        let mut dst = [std::ptr::null_mut::<u8>(); 64];
+        let mut buf = [0u8; 256];
+        'minor: while count > 0 && done < max {
+            // Every chunk first: nothing moves unless all are plain.
+            let (mut s2, mut d2) = (s, d);
+            let mut ns = 0;
+            let mut moved = 0;
+            while moved < nbytes {
+                match self.plain_ptr(s2, ssize) {
+                    Some(p) => src[ns] = p,
+                    None => break 'minor,
+                }
+                ns += 1;
+                moved += ssize;
+                s2 = modulo_add(s2, soff, smod);
+            }
+            let len = ns as u32 * ssize;
+            let mut nd = 0;
+            let mut written = 0;
+            while written + dsize <= len {
+                match self.plain_ptr(d2, dsize) {
+                    Some(p) => dst[nd] = p,
+                    None => break 'minor,
+                }
+                nd += 1;
+                written += dsize;
+                d2 = modulo_add(d2, doff, dmod);
+            }
+            // SAFETY: each pointer covers its chunk in DDR or SRAM, which
+            // nothing resizes while the bus is borrowed here.
+            unsafe {
+                if ssize == dsize {
+                    // As `dma_minor`: each unit (at most a longword) read,
+                    // then written.
+                    let unit = ssize.min(4) as usize;
+                    for (&a, &b) in src[..ns].iter().zip(&dst[..nd]) {
+                        for k in (0..ssize as usize).step_by(unit) {
+                            let mut v = [0u8; 4];
+                            std::ptr::copy_nonoverlapping(a.add(k), v.as_mut_ptr(), unit);
+                            std::ptr::copy_nonoverlapping(v.as_ptr(), b.add(k), unit);
+                        }
+                    }
+                } else {
+                    // All reads, then all writes.
+                    for (i, &a) in src[..ns].iter().enumerate() {
+                        std::ptr::copy_nonoverlapping(a, buf.as_mut_ptr().add(i * ssize as usize), ssize as usize);
+                    }
+                    for (i, &b) in dst[..nd].iter().enumerate() {
+                        std::ptr::copy_nonoverlapping(buf.as_ptr().add(i * dsize as usize), b, dsize as usize);
+                    }
+                }
+            }
+            s = s2;
+            d = d2;
+            count -= 1;
+            done += 1;
+            if t.csr & CSR_INTHALF != 0 && count == half && half != 0 {
+                self.io.edma.int |= 1 << ch;
+            }
+        }
+        if done == 0 {
+            return 0;
+        }
+        // As `dma_minor_done` leaves it after the last loop.
+        let b = &mut self.io.edma.tcd[ch * 32..ch * 32 + 32];
+        let csr = ((t.csr & !CSR_START) | CSR_ACTIVE) & !CSR_DONE;
+        b[0..4].copy_from_slice(&s.to_be_bytes());
+        b[0x10..0x14].copy_from_slice(&d.to_be_bytes());
+        let mask = if t.citer & 0x8000 != 0 { 0x01FF } else { 0x7FFF };
+        b[0x14..0x16].copy_from_slice(&((t.citer & !mask) | count).to_be_bytes());
+        b[0x1E..0x20].copy_from_slice(&csr.to_be_bytes());
+        if count == 0 {
+            self.dma_major_done(ch);
+        }
+        done
+    }
+
     /// Minor loop bookkeeping: the new addresses and count, the half and
     /// major completions, the minor link.
     fn dma_minor_done(&mut self, ch: usize, citer: u16, s: u32, d: u32) -> bool {
@@ -321,8 +439,8 @@ impl Bus {
             if sw {
                 // A software start runs the whole major loop.
                 let before = self.io.edma.majors[ch];
-                let mut n = 0;
-                while self.dma_minor(ch) {
+                let mut n = self.dma_minors_plain(ch, 0x10001);
+                while self.io.edma.majors[ch] == before && n <= 0x10000 && self.dma_minor(ch) {
                     n += 1;
                     if self.io.edma.majors[ch] != before || n > 0x10000 {
                         break;

@@ -10,10 +10,9 @@ It reimplements, in Rust, the machine described in
 [digiemu's DIGITAKT-MK1.md](https://github.com/irpina/digiemu/blob/main/DIGITAKT-MK1.md).
 
 **No firmware is included.** You need an OS update file from Elektron
-(`Digitakt_OS1.53.syx`). The MAIN OS inside it is checked by hash; other
-versions are refused, because the emulator uses a few addresses specific to
-that build. Firmware and everything derived from it (extracted sections,
-snapshots, card images) are git-ignored and must not be committed.
+(`Digitakt_OS1.53.syx`), or your own build of the MAIN OS (below).
+Firmware and everything derived from it (extracted sections, snapshots,
+card images) are git-ignored and must not be committed.
 
 ## Build
 
@@ -116,6 +115,28 @@ tests:
 
 Encoders: 0–7 are A–H, 8 is LEVEL/DATA.
 
+### Running a modified OS
+
+Every tool takes `--main-os IMAGE.bin` (or `DTEMU_MAIN_OS=IMAGE.bin`): a raw
+MAIN OS, as `fwinfo -o` extracts it, run in place of the update's own. It
+loads at 0x40000400 and starts at the address in its first longword.
+
+```sh
+./target/release/fwinfo fw/Digitakt_OS1.53.syx -o sections
+# ... patch sections/section_3_MAIN_OS.bin into my.bin ...
+./target/release/digitakt --main-os my.bin --card my.img --snapshot my.snap
+```
+
+The emulator finds what it needs in the image by the shape of the code,
+not by address, so a patched or rebuilt OS works as long as that code
+keeps its shape. Two things are required: the entry point and the SPI
+flash read, which the emulator serves from the update file. The rest
+(task creation, the frame the panel task sends, the fatal-error loop, the
+main loop, the current task, the +Drive's mounted flag) only feed the
+debugging output and are switched off, with a note, if not found. A build
+that is not OS 1.53 is reported by its hash at start. Snapshots belong to
+the image they were taken on and refuse any other.
+
 ## Tools
 
 | Binary | Purpose |
@@ -157,13 +178,15 @@ Encoders: 0–7 are A–H, 8 is LEVEL/DATA.
   PIT and DMA timers, UARTs, the 64-channel eDMA, the SSI audio port, the
   eSDHC with an eMMC the OS accepts, and the panel MCU's UART protocol
   (OLED tiles, LED palettes and selectors, key and encoder input).
+- **`symbols`**: finds the OS's entry, its SPI flash read and the
+  debugging hooks in the image by code signatures.
 - **`machine`**: boot setup, a high-level stand-in for the SPI flash read,
   idle-loop fast-forwarding, and the input helpers.
 - **`ekfs`**: the +Drive's filesystem (lookup3 checksums, hashed and
   sorted directory indexes, the sample format), byte-identical to the
   reference implementation.
 - **`snapshot`**: the whole machine, DDR compressed with LZ4, tied to the
-  MAIN OS hash.
+  MAIN OS image by its hash.
 
 Everything runs on one thread against one instruction clock: the CPU runs
 a block, then timers, the 48 kHz audio frame clock and DMA advance, and
@@ -178,6 +201,9 @@ pip install unicorn capstone
 python3 tools/cfdiff.py 4000      # random instructions against Unicorn's M68K
 CFDIFF_JIT=1 python3 tools/cfdiff.py 4000   # the same through the block compiler
 ./target/release/jitcheck snapshots/x.snap --instr 1G   # compiler vs interpreter
+# the audio itself, sample for sample: place two trigs, PLAY, turn, STOP
+A="--load snapshots/x.snap --instr 5G --press 24@200M --press 25@400M --press 10@700M --turn 0:3@1500Mx8/20M --press 11@4600M"
+./target/release/dtboot $A --wav jit.wav && DTEMU_NO_JIT=1 ./target/release/dtboot $A --wav interp.wav && cmp jit.wav interp.wav
 ./target/release/fwinfo fw/Digitakt_OS1.53.syx -o sections   # extract, then:
 python3 tools/cfdis.py 40075e00 +100   # disassemble MAIN OS
 ```

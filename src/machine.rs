@@ -110,12 +110,27 @@ impl Machine {
 
     fn install_hooks(&mut self) {
         let p = self.prof.clone();
-        for a in [p.flash_read, p.task_create, p.intro_done, p.panel_diff, p.abort_loop, p.mainloop] {
+        let opt = [p.task_create, p.intro_done, p.panel_diff, p.abort_loop, p.mainloop];
+        for a in std::iter::once(p.flash_read).chain(opt.into_iter().flatten()) {
             self.cpu.set_hook(a, true);
         }
         for &a in &p.idle_spins {
             self.cpu.set_hook(a, true);
         }
+    }
+
+    /// What to tell the user about the MAIN OS: whether it is OS 1.53, and
+    /// which debugging symbols this build lacks.
+    pub fn profile_notes(&self) -> Vec<String> {
+        let p = &self.prof;
+        let mut out = Vec::new();
+        if !p.is_os_153() {
+            out.push(format!("MAIN OS sha256 {} (not OS 1.53): symbols found by signature", p.sha256));
+        }
+        if !p.missing.is_empty() {
+            out.push(format!("not found in this build, their debugging aids are off: {}", p.missing.join(", ")));
+        }
+        out
     }
 
     pub fn add_counter(&mut self, pc: u32) {
@@ -140,6 +155,12 @@ impl Machine {
 
     /// Handle a hooked PC. -> true to let the instruction there execute.
     fn on_hook(&mut self, pc: u32, until: u64) -> bool {
+        // The abort loop is an idle spin too: note it, then idle.
+        if Some(pc) == self.prof.abort_loop && self.stats.abort_at.is_none() {
+            let caller = self.cpu.bus.peek32(self.cpu.a[7]);
+            self.stats.abort_at = Some((self.now(), caller));
+            self.note(format!("ABORT: reached the abort loop, return address 0x{caller:08x}"));
+        }
         let p = &self.prof;
         if pc == p.flash_read {
             // flash_read(offset, length, dest) -> 0, served from the image.
@@ -173,7 +194,7 @@ impl Machine {
             }
             return true;
         }
-        if pc == p.task_create {
+        if Some(pc) == p.task_create {
             let sp = self.cpu.a[7];
             let b = &self.cpu.bus;
             let (tcb, entry, prio) = (b.peek32(sp + 4), b.peek32(sp + 8), b.peek32(sp + 12));
@@ -181,15 +202,15 @@ impl Machine {
             self.note(format!("task_create entry=0x{entry:08x} prio={prio} tcb=0x{tcb:08x}"));
             return true;
         }
-        if pc == p.intro_done {
+        if Some(pc) == p.intro_done {
             if self.stats.intro_done_at.is_none() {
                 self.stats.intro_done_at = Some(self.now());
                 self.note("intro done".into());
             }
             return true;
         }
-        if pc == p.panel_diff {
-            let ptr = self.cpu.bus.peek32(p.fb_front);
+        if Some(pc) == p.panel_diff {
+            let ptr = p.fb_front.map_or(0, |a| self.cpu.bus.peek32(a));
             if (0x4000_0000..0x5000_0000).contains(&ptr) {
                 self.frame = Some(self.cpu.bus.peek_bytes(ptr, 1024));
                 self.frame_seq += 1;
@@ -197,15 +218,7 @@ impl Machine {
             }
             return true;
         }
-        if pc == p.abort_loop {
-            if self.stats.abort_at.is_none() {
-                self.stats.abort_at = Some((self.now(), self.cpu.bus.peek32(self.cpu.a[7])));
-                let caller = self.cpu.bus.peek32(self.cpu.a[7]);
-                self.note(format!("ABORT: reached the abort loop, return address 0x{caller:08x}"));
-            }
-            return true;
-        }
-        if pc == p.mainloop {
+        if Some(pc) == p.mainloop {
             self.stats.mainloop += 1;
             return true;
         }
@@ -263,7 +276,7 @@ impl Machine {
     /// Every task seen created: (entry, prio, tcb, parked pc, stack words).
     pub fn task_report(&self) -> String {
         let b = &self.cpu.bus;
-        let cur = b.peek32(self.prof.current_tcb);
+        let cur = self.prof.current_tcb.map(|a| b.peek32(a));
         let mut out = String::new();
         for &(entry, prio, tcb) in &self.stats.tasks {
             let sp = b.peek32(tcb + 0x48);
@@ -271,7 +284,7 @@ impl Machine {
             let words: Vec<String> = (2..14).map(|i| format!("{:08x}", b.peek32(sp + 4 * i))).collect();
             out += &format!(
                 "  prio {prio:>2} entry {entry:08x} tcb {tcb:08x}{} sp {sp:08x} pc {pc:08x} | {}\n",
-                if tcb == cur { " (running)" } else { "" },
+                if Some(tcb) == cur { " (running)" } else { "" },
                 words.join(" ")
             );
         }
@@ -296,9 +309,9 @@ impl Machine {
         self.cpu.bus.io.esdhc.card.flush()
     }
 
-    /// The firmware's own "+Drive mounted" flag.
-    pub fn drive_mounted(&self) -> bool {
-        self.cpu.bus.peek32(self.prof.mounted) == 1
+    /// The firmware's own "+Drive mounted" flag (None: not found in this build).
+    pub fn drive_mounted(&self) -> Option<bool> {
+        self.prof.mounted.map(|a| self.cpu.bus.peek32(a) == 1)
     }
 
     /// Press or release a key by control code (see `panel::key_name`).

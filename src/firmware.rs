@@ -211,6 +211,30 @@ impl Firmware {
         self.section(SEC_MAIN_OS)
             .ok_or_else(|| Error::Container("no MAIN OS section (id 3)".into()))
     }
+
+    /// Run `image` (a raw MAIN OS, as `fwinfo -o` extracts it) in place of
+    /// the update's own: a modified build, without packing it into a .syx.
+    pub fn replace_main_os(&mut self, image: Vec<u8>) -> Result<()> {
+        let s = self
+            .sections
+            .iter_mut()
+            .find(|s| s.entry.id == SEC_MAIN_OS)
+            .ok_or_else(|| Error::Container("no MAIN OS section (id 3)".into()))?;
+        s.data = image;
+        Ok(())
+    }
+
+    /// The firmware at `syx`, with its MAIN OS replaced by `main_os` if
+    /// given, else by the file `DTEMU_MAIN_OS` names, if set.
+    pub fn load(syx: &std::path::Path, main_os: Option<&std::path::Path>) -> Result<Firmware> {
+        let mut fw = Self::from_file(syx)?;
+        let env = std::env::var_os("DTEMU_MAIN_OS").map(std::path::PathBuf::from);
+        if let Some(p) = main_os.or(env.as_deref()) {
+            let d = std::fs::read(p).map_err(|e| Error::Syx(format!("cannot read {}: {e}", p.display())))?;
+            fw.replace_main_os(d)?;
+        }
+        Ok(fw)
+    }
 }
 
 // ---------------------------------------------------------------------------
