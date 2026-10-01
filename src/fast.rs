@@ -77,6 +77,12 @@ pub enum Kind {
     Sats,
     /// SWAP D(r).
     Swap,
+    /// MOVEM between registers (mask x) and a (to memory if r != 0).
+    Movem,
+    /// BTST/BCHG/BCLR/BSET D(x), D(r): kind 0-3.
+    BitDn { kind: u8 },
+    /// EOR D(x), D(r) at size.
+    EorDn { sz: u8 },
 }
 
 /// The kind of a natively decoded op (see `Kind`).
@@ -108,6 +114,8 @@ fn classify(o: &Op) -> Kind {
             let ss = (op >> 6) & 3;
             if op & 0x01C0 == 0x01C0 && op & 0xFFF8 != 0x49C0 {
                 Kind::Lea
+            } else if matches!(op & 0xFFC0, 0x48C0 | 0x4CC0) {
+                Kind::Movem
             } else if op & 0xFF00 == 0x4200 && ss != 3 {
                 Kind::Clr { sz: szf(ss) as u8 }
             } else if op & 0xFF00 == 0x4A00 && ss != 3 {
@@ -299,6 +307,23 @@ extern "C" fn h_movacc(c: &mut Cpu, o: &Op) {
 /// A single-word instruction with a native handler, if it has one.
 fn word_native(op: u16) -> Option<Op> {
     let r = (op & 7) as u8;
+    if op >> 12 == 0 && op & 0x0138 == 0x0100 {
+        // BTST..BSET Dx,Dy: the interpreter runs them; the block compiler
+        // translates them.
+        let mut o = mk(h_word_line(op));
+        o.r = r;
+        o.x = ((op >> 9) & 7) as u32;
+        o.k = Kind::BitDn { kind: ((op >> 6) & 3) as u8 };
+        return Some(o);
+    }
+    if op >> 12 == 0xB && (op >> 6) & 7 >= 4 && (op >> 6) & 7 <= 6 && (op >> 3) & 7 == 0 {
+        // EOR Dx,Dy, likewise.
+        let mut o = mk(h_word_line(op));
+        o.r = r;
+        o.x = ((op >> 9) & 7) as u32;
+        o.k = Kind::EorDn { sz: [1, 2, 4][((op >> 6) & 7) as usize - 4] };
+        return Some(o);
+    }
     if matches!(op & 0xFFF8, 0x4C80 | 0x4840) {
         // SATS / SWAP: the interpreter runs them; the block compiler
         // translates them.

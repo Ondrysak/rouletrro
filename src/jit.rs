@@ -414,7 +414,10 @@ fn flag_liveness(ops: &[Op]) -> Vec<(bool, bool)> {
             }
             // Reads V, writes N Z V C.
             Kind::Sats => nzvc = true,
-            Kind::Swap => nzvc = false,
+            Kind::Swap | Kind::EorDn { .. } => nzvc = false,
+            // Sets Z, keeps N V C: reads them.
+            Kind::BitDn { .. } => nzvc = true,
+            Kind::Movem => {}
             Kind::MoveA { .. } | Kind::Lea | Kind::QuickAn | Kind::Bra | Kind::Mac { .. } | Kind::MovAcc => {}
         }
     }
@@ -1245,6 +1248,62 @@ impl<'a> Tx<'a> {
                 let r = self.b.ins().rotl_imm_u(d, 16);
                 self.set_reg(dn, r);
                 self.logic_flags(r, 4, lf);
+            }
+            Kind::Movem => {
+                let base = self.addr(o.a, 4);
+                let mut k = 0;
+                for i in 0..16usize {
+                    if o.x & (1 << i) == 0 {
+                        continue;
+                    }
+                    let a = self.b.ins().iadd_imm_s(base, 4 * k);
+                    if o.r != 0 {
+                        let v = self.reg(i);
+                        self.write(a, 4, v);
+                    } else {
+                        let v = self.read(a, 4);
+                        self.set_reg(i, v);
+                    }
+                    k += 1;
+                }
+            }
+            Kind::BitDn { kind } => {
+                let dn = (o.r & 7) as usize;
+                let n = self.reg((o.x & 7) as usize);
+                let n = self.b.ins().band_imm_u(n, 31);
+                let one = self.k(1);
+                let m = self.b.ins().ishl(one, n);
+                let v = self.reg(dn);
+                let t = self.b.ins().band(v, m);
+                let z = self.b.ins().icmp_imm_u(IntCC::Equal, t, 0);
+                let z = self.bit(z, 2);
+                self.materialize();
+                let sr = self.sr();
+                let s0 = self.b.ins().band_imm_u(sr, !CF_Z & 0xFFFF);
+                let f = self.b.ins().bor(s0, z);
+                self.set_sr(f);
+                let nv = match kind {
+                    1 => Some(self.b.ins().bxor(v, m)),
+                    2 => {
+                        let nm = self.b.ins().bnot(m);
+                        Some(self.b.ins().band(v, nm))
+                    }
+                    3 => Some(self.b.ins().bor(v, m)),
+                    _ => None,
+                };
+                if let Some(nv) = nv {
+                    self.set_reg(dn, nv);
+                }
+            }
+            Kind::EorDn { sz } => {
+                let s = self.reg((o.x & 7) as usize);
+                let s = self.masked(s, sz);
+                let dn = (o.r & 7) as usize;
+                let d = self.reg(dn);
+                let d = self.masked(d, sz);
+                let r = self.b.ins().bxor(s, d);
+                self.put_dn(dn, sz, r);
+                self.logic_flags(r, sz, lf);
             }
             Kind::Bcc | Kind::Bra | Kind::Call => return false,
         }
