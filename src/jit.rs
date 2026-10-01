@@ -205,6 +205,7 @@ impl Jit {
             self.ctx.set_disasm(true);
         }
         let ok = module.define_function(id, &mut self.ctx).is_ok();
+        let size = self.ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
         if dump {
             if let Some(v) = self.ctx.compiled_code().and_then(|c| c.vcode.clone()) {
                 eprintln!("{v}");
@@ -217,6 +218,17 @@ impl Jit {
         }
         module.finalize_definitions().ok()?;
         let code = module.get_finalized_function(id);
+        // DTEMU_JIT_MAP=FILE: append each function's address, size, entry
+        // pc and machine code (hex), for matching a profile of the host.
+        if let Some(path) = std::env::var_os("DTEMU_JIT_MAP") {
+            use std::io::Write;
+            // SAFETY: `size` bytes of code were just written there.
+            let bytes = unsafe { std::slice::from_raw_parts(code, size) };
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "{:x} {size} {pc:08x} 1 {hex}", code as usize);
+            }
+        }
         // SAFETY: the function was built with BlockFn's signature.
         Some(unsafe { std::mem::transmute::<*const u8, BlockFn>(code) })
     }
@@ -368,6 +380,13 @@ fn inline_ok(o: &Op) -> bool {
         Kind::AluImm { .. } => !matches!(o.b, Ea::A(_) | Ea::Imm(_)),
         _ => true,
     }
+}
+
+/// Can EMAC state stay in variables across this op? Translated ops and
+/// branches, and calls to handlers that cannot touch it: every EMAC
+/// instruction is in line A. (State is written back before a call.)
+fn mac_safe(o: &Op) -> bool {
+    inline_ok(o) || matches!(o.k, Kind::Bcc | Kind::Bra) || (o.k == Kind::Call && o.op >> 12 != 0xA)
 }
 
 /// Which condition codes each op must leave correct: (N Z V C, X).
@@ -619,21 +638,34 @@ impl<'a> Tx<'a> {
 
     // -- memory ---------------------------------------------------------------
 
-    /// The host address for an inline access of `sz` bytes at `addr`
-    /// through page table `table`. -> (condition, host address)
-    fn page(&mut self, table: *const usize, addr: Value, sz: u8) -> (Value, Value) {
+    /// The inline path for an access of `sz` bytes at `addr` through page
+    /// table `table`: branches to `slow` unless the page is plain memory
+    /// and the access inside it (an aligned one always is), and otherwise
+    /// leaves the builder in a new block with the host address.
+    fn page(&mut self, table: *const usize, addr: Value, sz: u8, slow: cranelift_codegen::ir::Block) -> Value {
         let pg = self.b.ins().ushr_imm_u(addr, 16);
         let pg = self.b.ins().uextend(self.ptr, pg);
         let pg = self.b.ins().ishl_imm_u(pg, 3);
         let t = self.b.ins().iconst(self.ptr, table as usize as i64);
         let e = self.b.ins().iadd(t, pg);
         let host = self.b.ins().load(self.ptr, mf(), e, 0);
+        let mapped = self.b.create_block();
+        self.b.ins().brif(host, mapped, &[], slow, &[]);
+        self.b.switch_to_block(mapped);
         let off = self.b.ins().band_imm_u(addr, 0xFFFF);
-        let mapped = self.b.ins().icmp_imm_u(IntCC::NotEqual, host, 0);
-        let inside = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, off, 0x1_0000 - sz as i64);
-        let ok = self.b.ins().band(mapped, inside);
+        if sz > 1 {
+            // Aligned is inside; a misaligned access is checked.
+            let mis = self.b.ins().band_imm_u(addr, sz as i64 - 1);
+            let (fast, check) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(mis, check, &[], fast, &[]);
+            self.b.switch_to_block(check);
+            self.b.set_cold_block(check);
+            let inside = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, off, 0x1_0000 - sz as i64);
+            self.b.ins().brif(inside, fast, &[], slow, &[]);
+            self.b.switch_to_block(fast);
+        }
         let off = self.b.ins().uextend(self.ptr, off);
-        (ok, self.b.ins().iadd(host, off))
+        self.b.ins().iadd(host, off)
     }
 
     fn load_be(&mut self, p: Value, sz: u8) -> Value {
@@ -673,14 +705,10 @@ impl<'a> Tx<'a> {
     /// A read as `Bus::read*` makes it: plain memory inline, the rest
     /// through the bus.
     fn read(&mut self, addr: Value, sz: u8) -> Value {
-        let (ok, p) = self.page(self.mem.rd_pages, addr, sz);
-        let fast = self.b.create_block();
         let slow = self.b.create_block();
         let join = self.b.create_block();
         self.b.append_block_param(join, types::I32);
-        self.b.ins().brif(ok, fast, &[], slow, &[]);
-
-        self.b.switch_to_block(fast);
+        let p = self.page(self.mem.rd_pages, addr, sz, slow);
         let v = self.load_be(p, sz);
         self.b.ins().jump(join, &[v.into()]);
 
@@ -701,13 +729,9 @@ impl<'a> Tx<'a> {
     /// A write as `Bus::write*` makes it (stores near cached code go
     /// through the bus, which tells the block cache).
     fn write(&mut self, addr: Value, sz: u8, v: Value) {
-        let (ok, p) = self.page(self.mem.wr_pages, addr, sz);
-        let fast = self.b.create_block();
         let slow = self.b.create_block();
         let join = self.b.create_block();
-        self.b.ins().brif(ok, fast, &[], slow, &[]);
-
-        self.b.switch_to_block(fast);
+        let p = self.page(self.mem.wr_pages, addr, sz, slow);
         self.store_be(p, sz, v);
         self.b.ins().jump(join, &[]);
 
@@ -1906,7 +1930,7 @@ impl<'a> Tx<'a> {
         // MACSR), and one check on entry, running the block on the
         // interpreter if the mode is another.
         let has_mac = ops.iter().any(|o| matches!(o.k, Kind::Mac { .. } | Kind::MovAcc));
-        if translate && has_mac && ops.iter().all(|o| inline_ok(o) || matches!(o.k, Kind::Bcc | Kind::Bra)) {
+        if translate && has_mac && ops.iter().all(mac_safe) {
             use crate::cpu::{MACSR_FI, MACSR_OMC, MACSR_RT, MACSR_SU};
             self.omc = self.mem.macsr & MACSR_OMC != 0;
             let want = MACSR_FI | if self.omc { MACSR_OMC } else { 0 };
