@@ -27,6 +27,8 @@ counts (suffixes k, M, G); after --load they count from the snapshot's.
   --instr N            run N instructions (default 100M)
   --every N            report every N (default 10M)
   --ips N              instructions per emulated second (default 200M)
+  --main-os IMAGE.bin  run this MAIN OS (raw, as fwinfo -o extracts it)
+                       in place of the update's
   --load SNAP          resume a snapshot
   --save SNAP          save a snapshot at the end
   --card IMAGE         back the eMMC with an image file (read only: changes
@@ -53,6 +55,7 @@ Environment:
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut syx = None;
+    let mut main_os: Option<String> = None;
     let mut instr = 100_000_000u64;
     let mut every = 10_000_000u64;
     let mut ips = None;
@@ -74,6 +77,7 @@ fn main() {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--main-os" => main_os = it.next().cloned(),
             "--instr" => instr = num(it.next().unwrap()),
             "--every" => every = num(it.next().unwrap()),
             "--ips" => ips = Some(num(it.next().unwrap())),
@@ -123,8 +127,11 @@ fn main() {
         }
     }
     let syx = syx.unwrap_or_else(|| "fw/Digitakt_OS1.53.syx".into());
-    let fw = Firmware::from_file(std::path::Path::new(&syx)).unwrap();
+    let fw = Firmware::load(std::path::Path::new(&syx), main_os.as_deref().map(std::path::Path::new)).unwrap();
     let mut m = Machine::new(&fw, 128).unwrap();
+    for l in m.profile_notes() {
+        println!("{l}");
+    }
     if let Some(i) = ips {
         m.cpu.bus.io.ips = i as f64;
     }
@@ -150,7 +157,10 @@ fn main() {
         println!("card {p}: {} sectors in use{}", m.cpu.bus.io.esdhc.card.sectors.len(), if fresh { " (new, sample area formatted)" } else { "" });
     }
     if let Some(p) = &load {
-        dtemu::snapshot::load(&mut m, std::path::Path::new(p)).unwrap();
+        if let Err(e) = dtemu::snapshot::load(&mut m, std::path::Path::new(p)) {
+            eprintln!("{p}: {e}");
+            std::process::exit(1);
+        }
         println!("restored {p} at clock {}", m.now());
         // Every clock given counts from the snapshot's.
         let base = m.now();
@@ -332,7 +342,7 @@ fn main() {
             println!("  {a:08x} {:5.1}%", *n as f64 * 100.0 / total as f64);
         }
     }
-    println!("+Drive mounted: {}", m.drive_mounted());
+    println!("+Drive mounted: {}", m.drive_mounted().map_or("unknown (flag not found in this build)".into(), |v| v.to_string()));
     println!("icache: {} decodes, {} invalidating stores", m.cpu.bus.icache_decodes, m.cpu.bus.icache_invalidations);
     let c = &m.cpu;
     for (pc, a, n, v) in c.bus.watch_log.iter().take(40) {

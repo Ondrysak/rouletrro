@@ -138,7 +138,7 @@ fn main() {
             x => panic!("unknown option {x}"),
         }
     }
-    let fw = Firmware::from_file(std::path::Path::new("fw/Digitakt_OS1.53.syx")).unwrap();
+    let fw = Firmware::load(std::path::Path::new("fw/Digitakt_OS1.53.syx"), None).unwrap();
     let mut a = machine(&fw, &snap, false);
     let mut b = machine(&fw, &snap, true);
     let start = a.now();
