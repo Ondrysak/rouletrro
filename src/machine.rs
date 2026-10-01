@@ -72,8 +72,8 @@ impl Machine {
             bus.icache_enable(os.data.len() as u32);
         }
         let mut cpu = Cpu::new(bus);
-        // The block compiler is opt-in while it is being built out.
-        if std::env::var_os("DTEMU_JIT").is_some() {
+        // The block compiler (DTEMU_NO_JIT=1 runs the interpreter alone).
+        if std::env::var_os("DTEMU_NO_JIT").is_none() {
             cpu.jit = Some(Box::new(crate::jit::Jit::new(cpu.bus.icache_flushes)));
         }
         cpu.pc = prof.entry;

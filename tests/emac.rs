@@ -263,7 +263,8 @@ fn check_mac(jit: bool) {
         if jit {
             let ops = vec![dtemu::fast::decode(&f, CODE)];
             let mut j = dtemu::jit::Jit::new(0);
-            let mem = dtemu::jit::Mem::of(&mut f.bus);
+            let mut mem = dtemu::jit::Mem::of(&mut f.bus);
+            mem.macsr = f.macsr;
             let code = j.compile(CODE, &ops, mem).expect("compiles");
             // SAFETY: compiled from `ops`, alive for the call.
             unsafe { code(&mut f) };

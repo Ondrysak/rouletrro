@@ -100,12 +100,15 @@ pub struct Mem {
     pub code_span: u32,
     /// SRAM: 64 KB, aliased through 0x80000000-0x8BFFFFFF.
     pub sram: *mut u8,
+    /// MACSR when the block is compiled: EMAC blocks are specialized on
+    /// its OMC bit (and check it on entry).
+    pub macsr: u32,
 }
 
 impl Mem {
     pub fn of(bus: &mut crate::bus::Bus) -> Mem {
         let (base, mask, len, code_lo, code_span, sram) = bus.jit_mem();
-        Mem { base, mask, len, code_lo, code_span, sram }
+        Mem { base, mask, len, code_lo, code_span, sram, macsr: 0 }
     }
 }
 
@@ -228,14 +231,24 @@ enum St {
     Dirty,
 }
 
-/// How the current N Z V C were produced, for branching on the operands.
-#[derive(Clone, Copy)]
-enum Cc {
-    Unknown,
-    /// A logical result (masked to its size): V = C = 0.
-    Logic { r: Value, sz: u8 },
-    /// d - s at size (both masked): CMP, SUB.
-    Sub { s: Value, d: Value, sz: u8 },
+/// The flag-setting op whose condition codes are not in SR yet (lazy
+/// flags): its operands are in variables `fs` `fd` `fr`, and SR's N Z V C
+/// (and X where it sets X) are worked out only when something reads them.
+#[derive(Clone, Copy, PartialEq)]
+enum Pend {
+    None,
+    /// N Z of fr (masked to size), V = C = 0; X untouched.
+    Logic(u8),
+    /// fd + fs at size (add_flags): X = C.
+    Add(u8),
+    /// fd - fs at size (sub_flags): X = C, or kept (CMP: `true`).
+    Sub(u8, bool),
+}
+
+impl Pend {
+    fn writes_x(self) -> bool {
+        matches!(self, Pend::Add(_) | Pend::Sub(_, false))
+    }
 }
 
 const CF_C: i64 = 0x01;
@@ -332,10 +345,15 @@ struct Tx<'a> {
     sr_st: St,
     /// The clock at the start of the current pass through the ops.
     now: Variable,
-    cc: Cc,
+    pend: Pend,
+    fs: Variable,
+    fd: Variable,
+    fr: Variable,
     /// EMAC state cached in variables (blocks without calls, entered
     /// in fractional mode): MACSR and the accumulators.
     mac_cached: bool,
+    /// The OMC bit the EMAC code is specialized on (with `mac_cached`).
+    omc: bool,
     macsr: Variable,
     macsr_st: St,
     accs: [Variable; 4],
@@ -365,6 +383,9 @@ impl<'a> Tx<'a> {
         b.def_var(now, now0);
         let macsr = b.declare_var(types::I32);
         let accs = std::array::from_fn(|_| b.declare_var(types::I64));
+        let fs = b.declare_var(types::I32);
+        let fd = b.declare_var(types::I32);
+        let fr = b.declare_var(types::I32);
         let lastv = b.declare_var(types::I64);
         let lastpav = b.declare_var(types::I32);
         let z64 = b.ins().iconst(types::I64, 0);
@@ -385,8 +406,12 @@ impl<'a> Tx<'a> {
             sr,
             sr_st: St::Unloaded,
             now,
-            cc: Cc::Unknown,
+            pend: Pend::None,
+            fs,
+            fd,
+            fr,
             mac_cached: false,
+            omc: false,
             macsr,
             macsr_st: St::Unloaded,
             accs,
@@ -439,6 +464,7 @@ impl<'a> Tx<'a> {
 
     /// Write cached registers and SR back to the Cpu.
     fn flush(&mut self) {
+        self.materialize();
         for n in 0..16 {
             if self.reg_st[n] == St::Dirty {
                 let v = self.b.use_var(self.regs[n]);
@@ -472,7 +498,7 @@ impl<'a> Tx<'a> {
     fn forget(&mut self) {
         self.reg_st = [St::Unloaded; 16];
         self.sr_st = St::Unloaded;
-        self.cc = Cc::Unknown;
+        self.pend = Pend::None;
     }
 
     fn store_i32(&mut self, v: i64, off: usize) {
@@ -750,72 +776,118 @@ impl<'a> Tx<'a> {
         self.b.ins().bor(n, z)
     }
 
-    /// set_nz: N Z from r, V = C = 0, X kept. `r` masked to sz.
-    fn logic_flags(&mut self, r: Value, sz: u8, live: bool) {
-        self.cc = Cc::Unknown;
-        if !live {
-            return;
-        }
+    /// The pending op's carry (0/1 as i32), for Add and Sub.
+    fn pend_carry(&mut self, p: Pend) -> Value {
+        let s = self.b.use_var(self.fs);
+        let d = self.b.use_var(self.fd);
+        let c = match p {
+            Pend::Add(4) => {
+                let r = self.b.ins().iadd(d, s);
+                self.b.ins().icmp(IntCC::UnsignedLessThan, r, s)
+            }
+            Pend::Add(sz) => {
+                let w = self.b.ins().iadd(d, s);
+                let c = self.b.ins().ushr_imm_u(w, bits(sz));
+                let c = self.b.ins().band_imm_u(c, 1);
+                self.b.ins().icmp_imm_u(IntCC::NotEqual, c, 0)
+            }
+            _ => self.b.ins().icmp(IntCC::UnsignedGreaterThan, s, d),
+        };
+        self.bit(c, 0)
+    }
+
+    /// Work the pending op's condition codes into SR.
+    fn materialize(&mut self) {
+        let p = self.pend;
+        self.pend = Pend::None;
         let sr = self.sr();
-        let keep = self.b.ins().band_imm_u(sr, !0xF & 0xFFFF);
-        let nz = self.nz_bits(r, sz);
-        let n = self.b.ins().bor(keep, nz);
-        self.set_sr(n);
-        self.cc = Cc::Logic { r, sz };
+        let f = match p {
+            Pend::None => return,
+            Pend::Logic(sz) => {
+                let r = self.b.use_var(self.fr);
+                let keep = self.b.ins().band_imm_u(sr, !0xF & 0xFFFF);
+                let nz = self.nz_bits(r, sz);
+                self.b.ins().bor(keep, nz)
+            }
+            Pend::Add(sz) | Pend::Sub(sz, _) => {
+                let sub = matches!(p, Pend::Sub(..));
+                let s = self.b.use_var(self.fs);
+                let d = self.b.use_var(self.fd);
+                let w = if sub { self.b.ins().isub(d, s) } else { self.b.ins().iadd(d, s) };
+                let r = if sz == 4 { w } else { self.b.ins().band_imm_u(w, mask(sz)) };
+                let cbit = self.pend_carry(p);
+                let v = if sub {
+                    let a = self.b.ins().bxor(s, d);
+                    let b2 = self.b.ins().bxor(r, d);
+                    self.b.ins().band(a, b2)
+                } else {
+                    let a = self.b.ins().bxor(s, r);
+                    let b2 = self.b.ins().bxor(d, r);
+                    self.b.ins().band(a, b2)
+                };
+                let v = self.b.ins().ushr_imm_u(v, bits(sz) - 1);
+                let v = self.b.ins().band_imm_u(v, 1);
+                let v = self.b.ins().ishl_imm_u(v, 1);
+                let base = if p.writes_x() {
+                    let cx = self.b.ins().ishl_imm_u(cbit, 4);
+                    let s0 = self.b.ins().band_imm_u(sr, !0x1F & 0xFFFF);
+                    self.b.ins().bor(s0, cx)
+                } else {
+                    self.b.ins().band_imm_u(sr, !0xF & 0xFFFF)
+                };
+                let nz = self.nz_bits(r, sz);
+                let f = self.b.ins().bor(base, nz);
+                let f = self.b.ins().bor(f, v);
+                self.b.ins().bor(f, cbit)
+            }
+        };
+        self.set_sr(f);
+    }
+
+    /// An op is about to set N Z V C (and X if `writes_x`): the pending
+    /// op's codes die, except X if this op keeps it and it is still live.
+    fn drop_pending(&mut self, writes_x: bool, x_live: bool) {
+        let p = self.pend;
+        self.pend = Pend::None;
+        if p.writes_x() && !writes_x && x_live {
+            let c = self.pend_carry(p);
+            let x = self.b.ins().ishl_imm_u(c, 4);
+            let sr = self.sr();
+            let s0 = self.b.ins().band_imm_u(sr, !CF_X & 0xFFFF);
+            let n = self.b.ins().bor(s0, x);
+            self.set_sr(n);
+        }
+    }
+
+    /// Make `p` (operands s, d, result r) the pending op, if its codes can
+    /// be read (`live`: N Z V C, X).
+    fn set_pending(&mut self, p: Pend, s: Value, d: Value, r: Value, live: (bool, bool)) {
+        self.drop_pending(p.writes_x(), live.1);
+        if live.0 || (p.writes_x() && live.1) {
+            self.b.def_var(self.fs, s);
+            self.b.def_var(self.fd, d);
+            self.b.def_var(self.fr, r);
+            self.pend = p;
+        }
+    }
+
+    /// set_nz: N Z from r, V = C = 0, X kept. `r` masked to sz.
+    fn logic_flags(&mut self, r: Value, sz: u8, live: (bool, bool)) {
+        self.set_pending(Pend::Logic(sz), r, r, r, live);
     }
 
     /// add_flags / sub_flags (x = false), or cmp_flags (keep X). s and d
     /// masked to sz. -> the masked result.
-    fn arith(&mut self, sub: bool, s: Value, d: Value, sz: u8, keep_x: bool, live: bool) -> Value {
+    fn arith(&mut self, sub: bool, s: Value, d: Value, sz: u8, keep_x: bool, live: (bool, bool)) -> Value {
         let wide = if sub { self.b.ins().isub(d, s) } else { self.b.ins().iadd(d, s) };
         let r = if sz == 4 { wide } else { self.b.ins().band_imm_u(wide, mask(sz)) };
-        self.cc = Cc::Unknown;
-        if !live {
-            return r;
-        }
-        let c = if sub {
-            self.b.ins().icmp(IntCC::UnsignedGreaterThan, s, d)
-        } else if sz == 4 {
-            self.b.ins().icmp(IntCC::UnsignedLessThan, r, s)
-        } else {
-            let c = self.b.ins().ushr_imm_u(wide, bits(sz));
-            let c = self.b.ins().band_imm_u(c, 1);
-            self.b.ins().icmp_imm_u(IntCC::NotEqual, c, 0)
-        };
-        let v = if sub {
-            let a = self.b.ins().bxor(s, d);
-            let b2 = self.b.ins().bxor(r, d);
-            self.b.ins().band(a, b2)
-        } else {
-            let a = self.b.ins().bxor(s, r);
-            let b2 = self.b.ins().bxor(d, r);
-            self.b.ins().band(a, b2)
-        };
-        let v = self.b.ins().ushr_imm_u(v, bits(sz) - 1);
-        let v = self.b.ins().band_imm_u(v, 1);
-        let v = self.b.ins().ishl_imm_u(v, 1);
-        let cbit = self.bit(c, 0);
-        let sr = self.sr();
-        let base = if keep_x {
-            self.b.ins().band_imm_u(sr, !0xF & 0xFFFF)
-        } else {
-            let cx = self.b.ins().ishl_imm_u(cbit, 4);
-            let s0 = self.b.ins().band_imm_u(sr, !0x1F & 0xFFFF);
-            self.b.ins().bor(s0, cx)
-        };
-        let nz = self.nz_bits(r, sz);
-        let f = self.b.ins().bor(base, nz);
-        let f = self.b.ins().bor(f, v);
-        let f = self.b.ins().bor(f, cbit);
-        self.set_sr(f);
-        if sub {
-            self.cc = Cc::Sub { s, d, sz };
-        }
+        let p = if sub { Pend::Sub(sz, keep_x) } else { Pend::Add(sz) };
+        self.set_pending(p, s, d, r, live);
         r
     }
 
     /// `alu`: op 0 add, 1 sub, 2 and, 3 or, 4 eor, 5 cmp. s, d masked.
-    fn alu(&mut self, op: u8, s: Value, d: Value, sz: u8, live: bool) -> Value {
+    fn alu(&mut self, op: u8, s: Value, d: Value, sz: u8, live: (bool, bool)) -> Value {
         match op {
             0 => self.arith(false, s, d, sz, false, live),
             1 => self.arith(true, s, d, sz, false, live),
@@ -837,8 +909,10 @@ impl<'a> Tx<'a> {
 
     /// Condition `cc` (as `Cpu::cond`) -> an i8 truth value.
     fn cond(&mut self, cc: u8) -> Value {
-        match (self.cc, cc) {
-            (Cc::Sub { s, d, sz }, 2..=7 | 10..=15) => {
+        match (self.pend, cc) {
+            (Pend::Sub(sz, _), 2..=7 | 10..=15) => {
+                let s = self.b.use_var(self.fs);
+                let d = self.b.use_var(self.fd);
                 if matches!(cc, 10 | 11) {
                     // PL / MI: the sign of d - s at size.
                     let r = self.b.ins().isub(d, s);
@@ -861,7 +935,8 @@ impl<'a> Tx<'a> {
                 };
                 self.b.ins().icmp(c, d, s)
             }
-            (Cc::Logic { r, sz }, 2..=15) => {
+            (Pend::Logic(sz), 2..=15) => {
+                let r = self.b.use_var(self.fr);
                 let sv = self.sext(r, sz);
                 let (c, v) = match cc {
                     2 | 6 => (IntCC::NotEqual, r),
@@ -875,7 +950,10 @@ impl<'a> Tx<'a> {
                 };
                 self.b.ins().icmp_imm_s(c, v, 0)
             }
-            _ => self.cond_sr(cc),
+            _ => {
+                self.materialize();
+                self.cond_sr(cc)
+            }
         }
     }
 
@@ -924,7 +1002,7 @@ impl<'a> Tx<'a> {
 
     /// Translate op `o` inline. -> false if it must be a call.
     fn op(&mut self, o: &Op, live: (bool, bool)) -> bool {
-        let lf = live.0;
+        let lf = live;
         match o.k {
             Kind::Move { sz } => {
                 let v = self.get(o.a, sz);
@@ -963,14 +1041,14 @@ impl<'a> Tx<'a> {
                 let dn = (o.r & 7) as usize;
                 let d = self.reg(dn);
                 let d = self.b.ins().band_imm_u(d, mask(sz));
-                let r = self.alu(op, s, d, sz, lf || (op <= 1 && live.1));
+                let r = self.alu(op, s, d, sz, live);
                 if op != 5 {
                     self.put_dn(dn, sz, r);
                 }
             }
             Kind::AluImm { op, sz } => {
                 let s = self.k(o.x as i64 & mask(sz));
-                let need = lf || (op <= 1 && live.1);
+                let need = live;
                 match o.b {
                     Ea::D(r) => {
                         let dn = (r & 7) as usize;
@@ -1033,14 +1111,7 @@ impl<'a> Tx<'a> {
                         self.write(a, sz, z);
                     }
                 }
-                self.cc = Cc::Unknown;
-                if lf {
-                    let sr = self.sr();
-                    let s0 = self.b.ins().band_imm_u(sr, !0xF & 0xFFFF);
-                    let n = self.b.ins().bor_imm_u(s0, CF_Z);
-                    self.set_sr(n);
-                    self.cc = Cc::Logic { r: z, sz };
-                }
+                self.logic_flags(z, sz, lf);
             }
             Kind::Tst { sz } => {
                 let v = self.get(o.a, sz);
@@ -1065,6 +1136,7 @@ impl<'a> Tx<'a> {
             Kind::Sats => {
                 let dn = (o.r & 7) as usize;
                 let d = self.reg(dn);
+                self.materialize();
                 let sr = self.sr();
                 let v = self.b.ins().band_imm_u(sr, CF_V);
                 let ovf = self.b.ins().icmp_imm_u(IntCC::NotEqual, v, 0);
@@ -1100,7 +1172,7 @@ impl<'a> Tx<'a> {
                 _ => self.b.ins().sshr_imm_u(v, c),
             };
             self.set_reg(dn, res);
-            self.cc = Cc::Unknown;
+            self.drop_pending(true, live.1);
             if need {
                 let cy = if kind == 0 { self.b.ins().ushr_imm_u(v, 32 - c) } else { self.b.ins().ushr_imm_u(v, c - 1) };
                 let cy = self.b.ins().band_imm_u(cy, 1);
@@ -1114,6 +1186,8 @@ impl<'a> Tx<'a> {
             }
             return;
         }
+        // A zero count keeps X: it is an input.
+        self.materialize();
         let cnt = self.reg((o.x & 7) as usize);
         let c = self.b.ins().band_imm_u(cnt, 63);
         let zero = self.k(0);
@@ -1155,7 +1229,6 @@ impl<'a> Tx<'a> {
             }
         };
         self.set_reg(dn, res);
-        self.cc = Cc::Unknown;
         if need {
             let sr = self.sr();
             let keepx = self.b.ins().band_imm_u(sr, CF_X);
@@ -1170,6 +1243,8 @@ impl<'a> Tx<'a> {
     }
 
     fn addx(&mut self, o: &Op, sub: bool) {
+        // X and Z are inputs.
+        self.materialize();
         let sr = self.sr();
         let x = self.b.ins().ushr_imm_u(sr, 4);
         let x = self.b.ins().band_imm_u(x, 1);
@@ -1220,7 +1295,6 @@ impl<'a> Tx<'a> {
         let f = self.b.ins().bor(f, z);
         self.set_sr(f);
         self.set_reg(dn, r);
-        self.cc = Cc::Unknown;
     }
 
     // -- EMAC ---------------------------------------------------------------------
@@ -1484,14 +1558,17 @@ impl<'a> Tx<'a> {
         let m = self.b.use_var(self.macsr);
         let cur = self.acc(acc);
         let pav = (MACSR_PAV0 << acc) as i64;
-        let omc = self.b.ins().band_imm_u(m, MACSR_OMC as i64);
-        let omc_on = self.b.ins().icmp_imm_u(IntCC::NotEqual, omc, 0);
-        let has_pav = self.b.ins().band_imm_u(m, pav);
-        let pav_on = self.b.ins().icmp_imm_u(IntCC::NotEqual, has_pav, 0);
-        let frozen = self.b.ins().band(omc_on, pav_on);
+        let _ = MACSR_OMC;
         let compute = self.b.create_block();
         let after = self.b.create_block();
-        self.b.ins().brif(frozen, after, &[], compute, &[]);
+        if self.omc {
+            // OMC: an accumulator that overflowed stays frozen.
+            let has_pav = self.b.ins().band_imm_u(m, pav);
+            let frozen = self.b.ins().icmp_imm_u(IntCC::NotEqual, has_pav, 0);
+            self.b.ins().brif(frozen, after, &[], compute, &[]);
+        } else {
+            self.b.ins().jump(compute, &[]);
+        }
 
         self.b.switch_to_block(compute);
         let (x, y) = if long {
@@ -1520,12 +1597,17 @@ impl<'a> Tx<'a> {
         let e48 = self.b.ins().ishl_imm_u(sum, 16);
         let e48 = self.b.ins().sshr_imm_u(e48, 16);
         let ovf = self.b.ins().icmp(IntCC::NotEqual, e48, sum);
-        let neg = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, sum, 0);
-        let lo = self.b.ins().iconst(types::I64, 0xFFFF_FF80_0000_0000u64 as i64);
-        let hi = self.b.ins().iconst(types::I64, 0x007F_FFFF_FF00);
-        let sat = self.b.ins().select(neg, lo, hi);
-        let ovf_v = self.b.ins().select(omc_on, sat, e48);
-        let v = self.b.ins().select(ovf, ovf_v, sum);
+        let v = if self.omc {
+            // Saturate on overflow.
+            let neg = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, sum, 0);
+            let lo = self.b.ins().iconst(types::I64, 0xFFFF_FF80_0000_0000u64 as i64);
+            let hi = self.b.ins().iconst(types::I64, 0x007F_FFFF_FF00);
+            let sat = self.b.ins().select(neg, lo, hi);
+            self.b.ins().select(ovf, sat, sum)
+        } else {
+            // Wrap to 48 bits (equal to the sum when it fits).
+            e48
+        };
         self.set_acc(acc, v);
         let pk = self.k(pav);
         let zero = self.k(0);
@@ -1557,18 +1639,21 @@ impl<'a> Tx<'a> {
         let i = (o.x & 3) as usize;
         let a = self.acc(i);
         let m = self.b.use_var(self.macsr);
+        let _ = (m, MACSR_OMC);
         let q = self.b.ins().sshr_imm_u(a, 8);
         let q32 = self.b.ins().ireduce(types::I32, q);
-        let back = self.b.ins().sextend(types::I64, q32);
-        let wide = self.b.ins().icmp(IntCC::NotEqual, back, q);
-        let omc = self.b.ins().band_imm_u(m, MACSR_OMC as i64);
-        let omc_on = self.b.ins().icmp_imm_u(IntCC::NotEqual, omc, 0);
-        let sat_needed = self.b.ins().band(wide, omc_on);
-        let neg = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, q, 0);
-        let mn = self.k(i32::MIN as i64);
-        let mx = self.k(i32::MAX as i64);
-        let sat = self.b.ins().select(neg, mn, mx);
-        let v = self.b.ins().select(sat_needed, sat, q32);
+        let v = if self.omc {
+            // Saturate to 32 bits.
+            let back = self.b.ins().sextend(types::I64, q32);
+            let wide = self.b.ins().icmp(IntCC::NotEqual, back, q);
+            let neg = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, q, 0);
+            let mn = self.k(i32::MIN as i64);
+            let mx = self.k(i32::MAX as i64);
+            let sat = self.b.ins().select(neg, mn, mx);
+            self.b.ins().select(wide, sat, q32)
+        } else {
+            q32
+        };
         self.set_reg((o.r & 15) as usize, v);
         if o.x & 0x100 != 0 {
             // Clearing PAV changes what a pending V would be: settle first.
@@ -1651,10 +1736,12 @@ impl<'a> Tx<'a> {
         // interpreter if the mode is another.
         let has_mac = ops.iter().any(|o| matches!(o.k, Kind::Mac { .. } | Kind::MovAcc));
         if translate && has_mac && ops.iter().all(|o| inline_ok(o) || matches!(o.k, Kind::Bcc | Kind::Bra)) {
-            use crate::cpu::{MACSR_FI, MACSR_RT, MACSR_SU};
+            use crate::cpu::{MACSR_FI, MACSR_OMC, MACSR_RT, MACSR_SU};
+            self.omc = self.mem.macsr & MACSR_OMC != 0;
+            let want = MACSR_FI | if self.omc { MACSR_OMC } else { 0 };
             let m = self.b.ins().load(types::I32, mf(), self.cpu, offset_of!(Cpu, macsr) as i32);
-            let g = self.b.ins().band_imm_u(m, (MACSR_RT | MACSR_SU | MACSR_FI) as i64);
-            let ok = self.b.ins().icmp_imm_u(IntCC::Equal, g, MACSR_FI as i64);
+            let g = self.b.ins().band_imm_u(m, (MACSR_RT | MACSR_SU | MACSR_FI | MACSR_OMC) as i64);
+            let ok = self.b.ins().icmp_imm_u(IntCC::Equal, g, want as i64);
             let go = self.b.create_block();
             let other = self.b.create_block();
             self.b.ins().brif(ok, go, &[], other, &[]);
@@ -1723,7 +1810,6 @@ impl<'a> Tx<'a> {
     /// None for always; the fall-through pc)
     fn pass(&mut self, pc: u32, ops: &[Op], live: &[(bool, bool)]) -> (Option<Value>, u32) {
         let mut at = pc;
-        self.cc = Cc::Unknown;
         for (i, o) in ops[..ops.len() - 1].iter().enumerate() {
             self.i = i;
             self.op_pc = at;
@@ -1772,10 +1858,10 @@ impl<'a> Tx<'a> {
             self.b.ins().brif(ok, head, &[], taken_out, &[]);
             if copy == 1 {
                 // Both exits write back the state the passes leave.
-                let saved = (self.reg_st, self.sr_st, self.acc_st, self.macsr_st);
+                let saved = (self.reg_st, self.sr_st, self.acc_st, self.macsr_st, self.pend);
                 self.b.switch_to_block(taken_out);
                 self.leave(pc);
-                (self.reg_st, self.sr_st, self.acc_st, self.macsr_st) = saved;
+                (self.reg_st, self.sr_st, self.acc_st, self.macsr_st, self.pend) = saved;
                 self.b.switch_to_block(fall_out);
                 self.leave(next);
             }

@@ -614,7 +614,8 @@ impl Cpu {
         if jit.epoch != self.bus.icache_flushes {
             jit.reset(self.bus.icache_flushes);
         }
-        let mem = crate::jit::Mem::of(&mut self.bus);
+        let mut mem = crate::jit::Mem::of(&mut self.bus);
+        mem.macsr = self.macsr;
         let blk = &mut self.bus.blk_arena[i];
         let f = jit.compile(pc, &blk.ops, mem);
         blk.code = f;
